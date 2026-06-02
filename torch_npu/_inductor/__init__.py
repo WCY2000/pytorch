@@ -142,9 +142,57 @@ def _load_triton_backend():
     register_device_op_overrides_npu()
 
 
+def _load_tilelang_backend():
+    """
+    Register the TileLang codegen backend for Ascend NPU.
+
+    Activated by:
+        TORCHINDUCTOR_NPU_BACKEND=tilelang
+    """
+    import torch
+    from torch._inductor.codegen.common import (
+        register_backend_for_device,
+        register_device_op_overrides,
+    )
+    from torch._inductor.choices import InductorChoices
+    from torch._inductor import lowering as inductor_lowering
+    from torch_npu.utils._dynamo_device import NpuInterface, current_device, set_device
+    from torch._dynamo.device_interface import (
+        get_interface_for_device,
+        register_interface_for_device,
+    )
+
+    from . import config as npu_config
+    from .codegen.tilelang import TileLangScheduling
+    from .codegen.wrapper import NPUWrapperCodeGen
+    from .codegen.cpp_wrapper import CppWrapperNpu
+    from .decomposition import _register_npu_inductor_decompositons
+    from .lowering import npu_make_fallback, _register_npu_inductor_fallbacks
+    from .utils import disable_foreach
+
+    # Reuse NPU lowerings and decompositions — these are device-independent
+    # of the kernel codegen backend.
+    inductor_lowering.make_fallback = npu_make_fallback
+    _register_npu_inductor_decompositons()
+    _register_npu_inductor_fallbacks()
+
+    # Register TileLang scheduling for the "npu" device.
+    register_backend_for_device(
+        "npu", TileLangScheduling, NPUWrapperCodeGen, CppWrapperNpu
+    )
+
+    # Ensure the NPU device interface is registered (same as triton backend).
+    if get_interface_for_device("npu") is None:
+        register_interface_for_device("npu", NpuInterface)
+
+    disable_foreach()
+    register_device_op_overrides_npu()
+
+
 _BACKEND_LOADERS = {
-    "mlir": _load_mlir_backend,
-    "default": _load_triton_backend,
+    "mlir":      _load_mlir_backend,
+    "tilelang":  _load_tilelang_backend,
+    "default":   _load_triton_backend,
 }
 
 
