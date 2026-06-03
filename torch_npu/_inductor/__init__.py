@@ -18,6 +18,36 @@ if os.getenv('TORCHINDUCTOR_NPU_BACKEND', 'default') == 'mlir':
 elif os.getenv('TORCHINDUCTOR_NPU_BACKEND', 'default') == 'dvm':
     from .ascend_npu_ir.ascend_npu_ir.npu import npu_inductor_plugin
     from .dvm import mlir_fusion
+elif os.getenv('TORCHINDUCTOR_NPU_BACKEND', 'default') == 'tilelang':
+    import torch
+    from torch._dynamo.device_interface import get_interface_for_device, register_interface_for_device
+    from torch._inductor import lowering as inductor_lowering
+    from torch._inductor.codegen.common import register_backend_for_device, register_device_op_overrides
+    from torch_npu.utils._dynamo_device import NpuInterface
+
+    from .codegen.tilelang import TileLangScheduling
+    from .codegen.wrapper import NPUWrapperCodeGen
+    from .codegen.cpp_wrapper import CppWrapperNpu
+    from .decomposition import _register_npu_inductor_decompositons
+    from .lowering import npu_make_fallback, _register_npu_inductor_fallbacks
+    from .npu_device import NewNPUDeviceOpOverrides
+    from .codecache import patch_cache_base_get_system
+    from .utils import patch_is_gpu, patch_has_triton, disable_foreach
+
+    register_backend_for_device('npu', TileLangScheduling, NPUWrapperCodeGen, CppWrapperNpu)
+    register_device_op_overrides('npu', NewNPUDeviceOpOverrides())
+
+    if get_interface_for_device('npu') is None:
+        register_interface_for_device('npu', NpuInterface)
+
+    inductor_lowering.make_fallback = npu_make_fallback
+    _register_npu_inductor_decompositons()
+    _register_npu_inductor_fallbacks()
+
+    patch_cache_base_get_system()
+    patch_is_gpu()
+    patch_has_triton()
+    disable_foreach()
 else:
     import os
 
