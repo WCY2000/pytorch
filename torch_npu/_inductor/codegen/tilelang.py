@@ -527,7 +527,7 @@ class TileLangScheduling(SIMDScheduling):
 
             import tilelang as _tilelang_<N>
 
-            def _prim_factory_<name>(_xnumel):
+            def _prim_factory_<name>(xnumel):
                 # @T.prim_func definition (src_code)
                 return <name>_prim_fn
 
@@ -592,11 +592,11 @@ class TileLangScheduling(SIMDScheduling):
 
         # Factory: captures _xnumel as closure variable for the @T.prim_func.
         factory_params = (
-            ", ".join(f"_{n}" for n in numel_arg_names) if numel_arg_names else "_dummy=None"
+            ", ".join(numel_arg_names) if numel_arg_names else "_dummy=None"
         )
         code.writeline(f"def {factory_fn}({factory_params}):")
         with code.indent():
-            code.writeline(f"_xnumel = _{numel_arg_names[0]}" if numel_arg_names else "_xnumel = 1")
+            code.writeline(f"_xnumel = {numel_arg_names[0]}" if numel_arg_names else "_xnumel = 1")
             code.splice(src_code)
             code.writeline(f"return {prim_fn_name}")
 
