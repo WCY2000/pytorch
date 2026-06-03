@@ -422,28 +422,31 @@ class TileLangKernel(SIMDKernel):
                 "with T.Kernel(T.ceildiv(_xnumel, _XBLOCK), is_npu=True) as (cid, _):"
             )
             with code.indent():
-                # Allocate UB shared buffers for inputs.
+                # Inputs: T.alloc_shared (UB/cbuf) — supports bulk GM→UB DMA.
                 for _, (var, loc, dtype) in self._tl_inputs.items():
                     code.writeline(
                         f"{loc} = T.alloc_shared((_XBLOCK,), '{tilelang_dtype(dtype)}')"
                     )
-                # Allocate UB shared buffers for outputs not already used as inputs.
+                # Outputs: T.alloc_fragment (register file) — supports scalar
+                # writes inside T.Parallel.  Ascend UB (cbuf) does NOT allow
+                # scalar element stores (hivm.hir.store limitation).
+                # After T.Parallel the fragment is copied directly to GM.
                 input_locs = {loc for _, loc, _ in self._tl_inputs.values()}
                 for _, (var, loc, dtype) in self._tl_outputs.items():
                     if loc not in input_locs:
                         code.writeline(
-                            f"{loc} = T.alloc_shared((_XBLOCK,), '{tilelang_dtype(dtype)}')"
+                            f"{loc} = T.alloc_fragment((_XBLOCK,), '{tilelang_dtype(dtype)}')"
                         )
                 code.writeline("")
 
-                # T.copy GM -> UB  (offset form: size inferred from local shape).
+                # T.copy GM -> UB for every input.
                 for _, (var, loc, __) in self._tl_inputs.items():
                     code.writeline(f"T.copy({var}[cid * _XBLOCK], {loc})")
                 code.writeline("")
 
                 # T.Parallel compute body.
-                # Constraint: every buffer subscript in the body is the bare
-                # loop variable _tl_i with no transformation.
+                # Constraint: every buffer subscript is the bare loop variable
+                # _tl_i with no index transformation.
                 code.writeline("for _tl_i in T.Parallel(_XBLOCK):")
                 with code.indent():
                     loads_s   = self.loads.getvalue().strip()
@@ -459,7 +462,8 @@ class TileLangKernel(SIMDKernel):
                         code.writeline("pass")
                 code.writeline("")
 
-                # T.copy UB -> GM.
+                # T.copy fragment -> GM for every output.
+                # (T.alloc_fragment → GM direct copy is supported on Ascend.)
                 for _, (var, loc, __) in self._tl_outputs.items():
                     code.writeline(f"T.copy({loc}, {var}[cid * _XBLOCK])")
 
