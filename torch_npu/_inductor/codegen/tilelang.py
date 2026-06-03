@@ -8,39 +8,43 @@ Activate with::
 
     TORCHINDUCTOR_NPU_BACKEND=tilelang
 
-Generated kernel structure (Developer mode):
+Generated kernel structure:
 
     @T.prim_func
     def <name>_prim_fn(
-        in_ptr0: T.Tensor((_xnumel,), 'float16'),
-        out_ptr0: T.Tensor((_xnumel,), 'float16'),
+        in_ptr0: T.Tensor((_xnumel,), 'float32'),
+        out_ptr0: T.Tensor((_xnumel,), 'float32'),
     ):
         with T.Kernel(T.ceildiv(_xnumel, _XBLOCK), is_npu=True) as (cid, _):
-            _in_ptr0_local  = T.alloc_shared((_XBLOCK,), 'float16')
-            _out_ptr0_local = T.alloc_shared((_XBLOCK,), 'float16')
-            T.copy(in_ptr0[cid * _XBLOCK], _in_ptr0_local)   # GM -> UB
-            for _tl_i in T.Parallel(_XBLOCK):
-                tmp0 = _in_ptr0_local[_tl_i]
-                ...
-                _out_ptr0_local[_tl_i] = <result>
-            T.copy(_out_ptr0_local, out_ptr0[cid * _XBLOCK]) # UB -> GM
+            _in_ptr0_local  = T.alloc_shared((_XBLOCK,), 'float32')  # L1/UB
+            _out_ptr0_local = T.alloc_fragment((_XBLOCK,), 'float32') # fragment
+            T.copy(in_ptr0[cid * _XBLOCK], _in_ptr0_local)  # GM -> L1
+            T.vadd(_in_ptr0_local, _in_ptr1_local, _out_ptr0_local)  # vector op
+            T.copy(_out_ptr0_local, out_ptr0[cid * _XBLOCK])  # fragment -> GM
 
-Language constraints respected:
-- T.alloc_shared / T.alloc_ub: Ascend only supports float16 and float32.
-  Kernels with other dtypes raise NotImplementedError (fall back to Triton).
-- T.Parallel: buffer subscripts inside the loop body must use the bare
-  loop variable with no index transformation.  Our load/store always emit
-  ``buf[_tl_i]``, satisfying this constraint.
-- T.Kernel(is_npu=True) requires exactly one block dimension.
-- T.copy(src[offset], dst) / T.copy(src, dst[offset]): offset-form; copy
-  size is inferred from the destination buffer shape.
+Why vector ops instead of T.Parallel scalar loops:
+- On Ascend NPU, scalar element-wise stores to L1 (shared.dyn / cbuf) are not
+  supported by the BiShengHIR pipeline ('hivm.hir.store' only allows DMA copies).
+- T.alloc_fragment on NPU also maps to shared.dyn (same L1 memory), so scalar
+  stores to fragment buffers also fail.
+- The correct approach is to use TileLang's NPU vector intrinsics (T.vadd, T.vexp,
+  etc.) which lower to hardware vector instructions (hivm.hir.vadd, etc.).
+
+Op graph tracking:
+- TileLangCSE wraps inductor's CSE and records what op produced each temp var.
+- TileLangOverrides.* sets _pending_op on the kernel before returning the expr.
+- TileLangKernel.load() records which local buffer each CSE var reads from.
+- TileLangKernel.store() records which CSE var holds each output's value.
+- codegen_kernel() traverses this graph and emits T.v* calls.
 
 Known limitations:
 - Only 1-D contiguous pointwise kernels; reduction() raises NotImplementedError.
 - No tail guard when xnumel % _XBLOCK != 0.
+- Ops without a T.v* equivalent raise NotImplementedError (fallback to Triton).
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 import sympy
@@ -74,7 +78,6 @@ from torch._inductor.virtualized import ReductionType, StoreMode, V
 # dtype helpers
 # ---------------------------------------------------------------------------
 
-# Ascend UB (alloc_shared / alloc_ub) only supports fp16 and fp32.
 _TILELANG_UB_DTYPES: frozenset[torch.dtype] = frozenset({torch.float16, torch.float32})
 
 _TORCH_TO_TL_DTYPE: dict[torch.dtype, str] = {
@@ -96,10 +99,6 @@ def tilelang_dtype(dtype: torch.dtype) -> str:
 
 
 def _assert_ub_dtype(name: str, dtype: torch.dtype) -> None:
-    """
-    Raise NotImplementedError for dtypes not allocatable on Ascend UB memory.
-    The inductor scheduler catches this and falls back to the Triton backend.
-    """
     if dtype not in _TILELANG_UB_DTYPES:
         raise NotImplementedError(
             f"TileLang backend: Ascend UB supports float16/float32 only; "
@@ -108,11 +107,131 @@ def _assert_ub_dtype(name: str, dtype: torch.dtype) -> None:
 
 
 # ---------------------------------------------------------------------------
+# NPU vector op mappings
+# ---------------------------------------------------------------------------
+
+# Binary vector ops: T.vXXX(A, B, C)  where B may be a scalar float/int
+_BINARY_VEC_OPS: dict[str, str] = {
+    "add":         "vadd",
+    "sub":         "vsub",
+    "mul":         "vmul",
+    "truediv":     "vdiv",
+    "maximum":     "vmax",
+    "minimum":     "vmin",
+    "pow":         "vpow",
+    "bitwise_and": "vand",
+    "bitwise_or":  "vor",
+    "bitwise_xor": "vxor",
+}
+
+# Unary vector ops: T.vXXX(A, B)
+_UNARY_VEC_OPS: dict[str, str] = {
+    "exp":     "vexp",
+    "log":     "vln",
+    "exp2":    "vexp2",
+    "log2":    "vlog2",
+    "relu":    "vrelu",
+    "sigmoid": "vsigmoid",
+    "sqrt":    "vsqrt",
+    "rsqrt":   "vrsqrt",
+    "abs":     "vabs",
+    "cos":     "vcos",
+    "sin":     "vsin",
+    "erf":     "verf",
+    "tanh":    "vtanh",
+}
+
+
+# ---------------------------------------------------------------------------
+# Expression → op parser
+# ---------------------------------------------------------------------------
+
+def _parse_expr_op(expr: str) -> Optional[tuple[str, list[str]]]:
+    """
+    Parse a scalar expression string emitted by TileLangOverrides and return
+    (op_name, [operand_str, ...]) or None if unrecognised.
+
+    Since inductor's CSE assigns a fresh tmp var to each compound expression,
+    both operands of a binary op are always simple identifiers or number
+    literals at the time this is called.
+    """
+    s = expr.strip()
+
+    # --- unary: (-x) ---
+    m = re.match(r'^\(-(\w+)\)$', s)
+    if m:
+        return ("neg", [m.group(1)])
+
+    # --- unary: abs(x) ---
+    m = re.match(r'^abs\((\w+)\)$', s)
+    if m:
+        return ("abs", [m.group(1)])
+
+    # --- unary: T.exp(x), T.sigmoid(x) ---
+    m = re.match(r'^T\.(\w+)\((\w+)\)$', s)
+    if m:
+        fn = m.group(1)
+        arg = m.group(2)
+        if fn in ("exp", "sigmoid"):
+            return (fn, [arg])
+
+    # --- unary: _math.xxx(x) ---
+    _math_unary = {
+        "log": "log", "log2": "log2", "log1p": "log1p",
+        "sqrt": "sqrt", "sin": "sin", "cos": "cos",
+        "tan": "tan", "tanh": "tanh",
+        "asin": "asin", "acos": "acos", "atan": "atan",
+        "erf": "erf", "erfc": "erfc",
+        "floor": "floor", "ceil": "ceil", "trunc": "trunc",
+    }
+    m = re.match(r'^_math\.(\w+)\((\w+)\)$', s)
+    if m and m.group(1) in _math_unary:
+        return (_math_unary[m.group(1)], [m.group(2)])
+
+    # --- relu: ((x) if (x) > 0.0 else 0.0) ---
+    m = re.match(r'^\(\((\w+)\) if \(\1\) > 0\.0 else 0\.0\)$', s)
+    if m:
+        return ("relu", [m.group(1)])
+
+    # --- binary: _math.pow(a, b) and _math.atan2(a, b) ---
+    m = re.match(r'^_math\.pow\((\w+),\s*(\S+)\)$', s)
+    if m:
+        return ("pow", [m.group(1), m.group(2)])
+    m = re.match(r'^_math\.atan2\((\w+),\s*(\w+)\)$', s)
+    if m:
+        return ("atan2", [m.group(1), m.group(2)])
+
+    # --- binary: (a OP b) ---
+    _bin_patterns: list[tuple[str, str]] = [
+        (r'^\((\w+) \+ (\S+)\)$',  "add"),
+        (r'^\((\w+) - (\S+)\)$',   "sub"),
+        (r'^\((\w+) \* (\S+)\)$',  "mul"),
+        (r'^\((\w+) / (\S+)\)$',   "truediv"),
+        (r'^\((\w+) // (\S+)\)$',  "floordiv"),
+        (r'^\((\w+) % (\S+)\)$',   "mod"),
+        (r'^\((\w+) & (\S+)\)$',   "bitwise_and"),
+        (r'^\((\w+) \| (\S+)\)$',  "bitwise_or"),
+        (r'^\((\w+) \^ (\S+)\)$',  "bitwise_xor"),
+        (r'^\((\w+) < (\S+)\)$',   "lt"),
+        (r'^\((\w+) <= (\S+)\)$',  "le"),
+        (r'^\((\w+) > (\S+)\)$',   "gt"),
+        (r'^\((\w+) >= (\S+)\)$',  "ge"),
+        (r'^\((\w+) == (\S+)\)$',  "eq"),
+        (r'^\((\w+) != (\S+)\)$',  "ne"),
+    ]
+    for pattern, op in _bin_patterns:
+        m = re.match(pattern, s)
+        if m:
+            return (op, [m.group(1), m.group(2)])
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # CSE variable
 # ---------------------------------------------------------------------------
 
 class TileLangCSEVariable(CSEVariable):
-    """Scalar CSE variable for expressions inside a T.Parallel body."""
     pass
 
 
@@ -120,14 +239,21 @@ class TileLangCSEVariable(CSEVariable):
 # Op overrides
 # ---------------------------------------------------------------------------
 
+def _set_pending(op: str, operands: list, dtype: Optional[torch.dtype] = None) -> None:
+    """Set _pending_op on the current TileLangKernel (called from overrides)."""
+    try:
+        k = V.kernel
+        if isinstance(k, TileLangKernel):
+            k._pending_op = (op, operands, dtype)
+    except AttributeError:
+        pass
+
+
 class TileLangOverrides(OpOverrides):
     """
-    Map inductor element-wise ops to scalar Python expressions valid inside
-    a ``T.Parallel`` loop body.
-
-    Inside T.Parallel the compiler treats the body as scalar code and lowers
-    it to NPU vector instructions automatically.  T.exp / T.sigmoid map to
-    native hardware instructions; arithmetic uses plain Python operators.
+    Maps inductor element-wise ops to scalar Python expressions (used for
+    the string CSE) and simultaneously records the op type on the kernel
+    for NPU vector code emission.
     """
 
     @staticmethod
@@ -149,65 +275,153 @@ class TileLangOverrides(OpOverrides):
         return repr(prim.dtype_to_type(dtype)(value))
 
     @staticmethod
-    def abs(x):        return f"abs({x})"
+    def abs(x):
+        _set_pending("abs", [x])
+        return f"abs({x})"
+
     @staticmethod
-    def neg(x):        return f"(-{x})"
+    def neg(x):
+        _set_pending("neg", [x])
+        return f"(-{x})"
+
     @staticmethod
-    def exp(x):        return f"T.exp({x})"
+    def exp(x):
+        _set_pending("exp", [x])
+        return f"T.exp({x})"
+
     @staticmethod
-    def exp2(x):       return f"_math.pow(2.0, {x})"
+    def exp2(x):
+        _set_pending("exp2", [x])
+        return f"_math.pow(2.0, {x})"
+
     @staticmethod
-    def expm1(x):      return f"(T.exp({x}) - 1.0)"
+    def expm1(x):
+        # No single NPU intrinsic; will be caught as unsupported during emit
+        return f"(T.exp({x}) - 1.0)"
+
     @staticmethod
-    def log(x):        return f"_math.log({x})"
+    def log(x):
+        _set_pending("log", [x])
+        return f"_math.log({x})"
+
     @staticmethod
-    def log2(x):       return f"_math.log2({x})"
+    def log2(x):
+        _set_pending("log2", [x])
+        return f"_math.log2({x})"
+
     @staticmethod
-    def log1p(x):      return f"_math.log1p({x})"
+    def log1p(x):
+        return f"_math.log1p({x})"
+
     @staticmethod
-    def sqrt(x):       return f"_math.sqrt({x})"
+    def sqrt(x):
+        _set_pending("sqrt", [x])
+        return f"_math.sqrt({x})"
+
     @staticmethod
-    def rsqrt(x):      return f"(1.0 / _math.sqrt({x}))"
+    def rsqrt(x):
+        _set_pending("rsqrt", [x])
+        return f"(1.0 / _math.sqrt({x}))"
+
     @staticmethod
-    def sin(x):        return f"_math.sin({x})"
+    def sin(x):
+        _set_pending("sin", [x])
+        return f"_math.sin({x})"
+
     @staticmethod
-    def cos(x):        return f"_math.cos({x})"
+    def cos(x):
+        _set_pending("cos", [x])
+        return f"_math.cos({x})"
+
     @staticmethod
-    def tan(x):        return f"_math.tan({x})"
+    def tan(x):
+        _set_pending("tan", [x])
+        return f"_math.tan({x})"
+
     @staticmethod
-    def tanh(x):       return f"_math.tanh({x})"
+    def tanh(x):
+        _set_pending("tanh", [x])
+        return f"_math.tanh({x})"
+
     @staticmethod
-    def asin(x):       return f"_math.asin({x})"
+    def asin(x):
+        _set_pending("asin", [x])
+        return f"_math.asin({x})"
+
     @staticmethod
-    def acos(x):       return f"_math.acos({x})"
+    def acos(x):
+        _set_pending("acos", [x])
+        return f"_math.acos({x})"
+
     @staticmethod
-    def atan(x):       return f"_math.atan({x})"
+    def atan(x):
+        _set_pending("atan", [x])
+        return f"_math.atan({x})"
+
     @staticmethod
-    def atan2(x, y):   return f"_math.atan2({x}, {y})"
+    def atan2(x, y):
+        _set_pending("atan2", [x, y])
+        return f"_math.atan2({x}, {y})"
+
     @staticmethod
-    def sigmoid(x):    return f"T.sigmoid({x})"
+    def sigmoid(x):
+        _set_pending("sigmoid", [x])
+        return f"T.sigmoid({x})"
+
     @staticmethod
-    def relu(x):       return f"(({x}) if ({x}) > 0.0 else 0.0)"
+    def relu(x):
+        _set_pending("relu", [x])
+        return f"(({x}) if ({x}) > 0.0 else 0.0)"
+
     @staticmethod
-    def minimum(a, b): return f"(({a}) if ({a}) < ({b}) else ({b}))"
+    def minimum(a, b):
+        _set_pending("minimum", [a, b])
+        return f"(({a}) if ({a}) < ({b}) else ({b}))"
+
     @staticmethod
-    def maximum(a, b): return f"(({a}) if ({a}) > ({b}) else ({b}))"
+    def maximum(a, b):
+        _set_pending("maximum", [a, b])
+        return f"(({a}) if ({a}) > ({b}) else ({b}))"
+
     @staticmethod
-    def where(cond, a, b): return f"(({a}) if ({cond}) else ({b}))"
+    def where(cond, a, b):
+        return f"(({a}) if ({cond}) else ({b}))"
+
     @staticmethod
-    def add(a, b):      return f"({a} + {b})"
+    def add(a, b):
+        _set_pending("add", [a, b])
+        return f"({a} + {b})"
+
     @staticmethod
-    def sub(a, b):      return f"({a} - {b})"
+    def sub(a, b):
+        _set_pending("sub", [a, b])
+        return f"({a} - {b})"
+
     @staticmethod
-    def mul(a, b):      return f"({a} * {b})"
+    def mul(a, b):
+        _set_pending("mul", [a, b])
+        return f"({a} * {b})"
+
     @staticmethod
-    def truediv(a, b):  return f"({a} / {b})"
+    def truediv(a, b):
+        _set_pending("truediv", [a, b])
+        return f"({a} / {b})"
+
     @staticmethod
-    def floordiv(a, b): return f"({a} // {b})"
+    def floordiv(a, b):
+        _set_pending("floordiv", [a, b])
+        return f"({a} // {b})"
+
     @staticmethod
-    def mod(a, b):      return f"({a} % {b})"
+    def mod(a, b):
+        _set_pending("mod", [a, b])
+        return f"({a} % {b})"
+
     @staticmethod
-    def pow(a, b):      return f"_math.pow({a}, {b})"
+    def pow(a, b):
+        _set_pending("pow", [a, b])
+        return f"_math.pow({a}, {b})"
+
     @staticmethod
     def logical_not(a):    return f"(not ({a}))"
     @staticmethod
@@ -216,26 +430,53 @@ class TileLangOverrides(OpOverrides):
     def logical_or(a, b):  return f"(({a}) or ({b}))"
     @staticmethod
     def logical_xor(a, b): return f"(bool({a}) != bool({b}))"
+
     @staticmethod
-    def bitwise_and(a, b): return f"(({a}) & ({b}))"
+    def bitwise_and(a, b):
+        _set_pending("bitwise_and", [a, b])
+        return f"(({a}) & ({b}))"
+
     @staticmethod
-    def bitwise_or(a, b):  return f"(({a}) | ({b}))"
+    def bitwise_or(a, b):
+        _set_pending("bitwise_or", [a, b])
+        return f"(({a}) | ({b}))"
+
     @staticmethod
-    def bitwise_xor(a, b): return f"(({a}) ^ ({b}))"
+    def bitwise_xor(a, b):
+        _set_pending("bitwise_xor", [a, b])
+        return f"(({a}) ^ ({b}))"
+
     @staticmethod
     def bitwise_not(a):    return f"(~({a}))"
+
     @staticmethod
     def sign(x):  return f"(1 if ({x}) > 0 else (-1 if ({x}) < 0 else 0))"
+
     @staticmethod
-    def floor(x): return f"_math.floor({x})"
+    def floor(x):
+        _set_pending("floor", [x])
+        return f"_math.floor({x})"
+
     @staticmethod
-    def ceil(x):  return f"_math.ceil({x})"
+    def ceil(x):
+        _set_pending("ceil", [x])
+        return f"_math.ceil({x})"
+
     @staticmethod
-    def trunc(x): return f"_math.trunc({x})"
+    def trunc(x):
+        _set_pending("trunc", [x])
+        return f"_math.trunc({x})"
+
     @staticmethod
-    def erf(x):   return f"_math.erf({x})"
+    def erf(x):
+        _set_pending("erf", [x])
+        return f"_math.erf({x})"
+
     @staticmethod
-    def erfc(x):  return f"_math.erfc({x})"
+    def erfc(x):
+        _set_pending("erfc", [x])
+        return f"_math.erfc({x})"
+
     @staticmethod
     def lt(a, b): return f"({a} < {b})"
     @staticmethod
@@ -273,29 +514,98 @@ class TileLangOverrides(OpOverrides):
 _DEFAULT_XBLOCK = 128
 
 
+def _resolve_operand(operand) -> str:
+    """Convert a CSEVariable or string operand to a string suitable for T.v* calls."""
+    if isinstance(operand, (int, float)):
+        return repr(operand)
+    return str(operand)
+
+
+def _build_vec_ops(
+    var,
+    target_buf: str,
+    ops_list: list,
+    var_bufs: dict,
+    var_ops: dict,
+    _visited: Optional[set] = None,
+) -> str:
+    """
+    Recursively traverse the op graph rooted at `var` and append
+    (op_name, resolved_operands, out_buf) tuples to `ops_list` in
+    topological (post) order.
+
+    Returns the buffer name that will hold the result of `var`.
+    For input-buffer vars this is the existing local buffer name.
+    For computed vars this is `target_buf`.
+    """
+    if _visited is None:
+        _visited = set()
+
+    var_name = str(var)
+
+    # Direct input buffer
+    if var_name in var_bufs:
+        return var_bufs[var_name]
+
+    # Computed var
+    if var_name in var_ops:
+        if var_name in _visited:
+            # Already scheduled into ops_list (diamond in the DAG)
+            # Return whatever buf was assigned
+            for _, _, out in ops_list:
+                pass  # find last assignment — use target_buf as hint
+            return f"_{var_name}_frag"
+
+        _visited.add(var_name)
+        op_name, operands = var_ops[var_name]
+        resolved = []
+        for op in operands:
+            op_str = str(op)
+            if op_str in var_bufs:
+                resolved.append(var_bufs[op_str])
+            elif op_str in var_ops:
+                inter_buf = f"_{op_str}_frag"
+                src = _build_vec_ops(op, inter_buf, ops_list, var_bufs, var_ops, _visited)
+                resolved.append(src)
+            else:
+                # Constant or unknown identifier
+                try:
+                    resolved.append(float(op_str))
+                except (ValueError, TypeError):
+                    resolved.append(op_str)
+        ops_list.append((op_name, resolved, target_buf))
+        return target_buf
+
+    # Fallback: treat as a literal / unknown symbol
+    return var_name
+
+
 class TileLangKernel(SIMDKernel):
     """
     Generates a TileLang @T.prim_func body for a fused set of pointwise nodes.
 
-    Uses **Developer mode** (T.alloc_shared + T.Parallel) so that arbitrary
-    fused element-wise expressions produced by inductor CSE are naturally
-    lowered to NPU vector instructions by the TileLang compiler.
-
-    T.Parallel index constraint: every buffer access inside the loop body
-    uses the bare loop variable ``_tl_i`` with no transformation, satisfying
-    the "下标不能做变换" restriction documented in T.Parallel.
+    Uses NPU vector intrinsics (T.vadd, T.vexp, ...) instead of T.Parallel
+    scalar loops — scalar element-wise stores to Ascend L1 (cbuf) are not
+    supported by the BiShengHIR pipeline.
     """
 
     overrides = TileLangOverrides  # type: ignore[assignment]
-    # Python-style sympy printer — no tl.* type suffixes needed for TileLang.
-    kexpr = SIMDKernel.sexpr  # type: ignore[assignment]
+    kexpr = SIMDKernel.sexpr       # type: ignore[assignment]
 
     def __init__(self, tiling: dict, **kwargs) -> None:
         super().__init__(tiling, **kwargs)
         self.cse: CSE = CSE(self.newvar_prefix, self.suffix)
-        # buffer name -> (ptr_var, local_var_name, dtype)
+
+        # Buffer registry
         self._tl_inputs:  dict[str, tuple[str, str, torch.dtype]] = {}
         self._tl_outputs: dict[str, tuple[str, str, torch.dtype]] = {}
+
+        # Op graph (built during load/store/overrides calls)
+        self._pending_op: Optional[tuple] = None
+        self._var_ops:    dict[str, tuple] = {}   # var_name → (op, operands)
+        self._var_bufs:   dict[str, str] = {}     # var_name → local_buf_name
+        self._var_dtypes: dict[str, torch.dtype] = {}
+        self._output_vars: dict[str, tuple] = {}  # local_buf_name → (var, dtype)
 
     # ------------------------------------------------------------------
     # SIMDKernel abstract interface
@@ -305,8 +615,6 @@ class TileLangKernel(SIMDKernel):
         return tilelang_dtype(dtype)
 
     def codegen_iteration_ranges_entry(self, entry: IterationRangesEntry) -> None:
-        # T.Kernel + T.Parallel handle dispatch; suppress Triton-style
-        # xoffset/xindex/xmask range-tree preamble entirely.
         pass
 
     def iteration_ranges_get_pid(self, entry: IterationRangesRoot) -> str:
@@ -323,21 +631,19 @@ class TileLangKernel(SIMDKernel):
     # ------------------------------------------------------------------
 
     def load(self, name: str, index: sympy.Expr) -> TileLangCSEVariable:
-        """
-        Register *name* as needing a T.copy (GM → UB) and return a CSE
-        variable referencing element ``_tl_i`` of the local shared buffer.
-
-        The sympy *index* is intentionally ignored — flat 1-D contiguous
-        layout is assumed.  Strided / non-contiguous access requires
-        index-aware UB mapping (future work).
-        """
         dtype = V.graph.get_dtype(name)
         _assert_ub_dtype(name, dtype)
         var = self.args.input(name)
         local_name = f"_{var}_local"
         if name not in self._tl_inputs:
             self._tl_inputs[name] = (var, local_name, dtype)
-        return self.cse.generate(self.loads, f"{local_name}[_tl_i]", dtype=dtype)
+        # Clear any stale _pending_op so load vars are never mis-attributed.
+        self._pending_op = None
+        cse_var = self.cse.generate(self.loads, f"{local_name}[_tl_i]", dtype=dtype)
+        # Record: this CSE var reads from `local_name`
+        self._var_bufs[cse_var.name] = local_name
+        self._var_dtypes[cse_var.name] = dtype
+        return cse_var
 
     def store(
         self,
@@ -346,10 +652,6 @@ class TileLangKernel(SIMDKernel):
         value: TileLangCSEVariable,
         mode: StoreMode = None,
     ) -> None:
-        """
-        Register *name* as needing a T.copy (UB → GM) and emit the element
-        write into the local shared buffer.
-        """
         if mode == "atomic_add":
             raise NotImplementedError(
                 "TileLang backend: atomic_add store not yet supported"
@@ -360,6 +662,9 @@ class TileLangKernel(SIMDKernel):
         local_name = f"_{var}_local"
         if name not in self._tl_outputs:
             self._tl_outputs[name] = (var, local_name, dtype)
+        # Record: local_name should be filled with the result of `value`
+        self._output_vars[local_name] = (value, dtype)
+        # Keep scalar emit for debugging / non-NPU paths
         self.stores.writeline(f"{local_name}[_tl_i] = {value}")
 
     def reduction(
@@ -379,23 +684,11 @@ class TileLangKernel(SIMDKernel):
     # ------------------------------------------------------------------
 
     def codegen_kernel(self, name: Optional[str] = None) -> str:
-        """
-        Return the @T.prim_func source string.
-
-        TileLangScheduling.define_kernel() wraps this inside a per-shape
-        factory so that ``_xnumel`` is a closure variable at compile time.
-
-        T.copy syntax (offset form — copy size inferred from dst shape):
-            T.copy(global_buf[cid * _XBLOCK], local_buf)   # GM -> UB
-            T.copy(local_buf, global_buf[cid * _XBLOCK])   # UB -> GM
-        """
         xblock       = _DEFAULT_XBLOCK
         prim_fn_name = f"{name or str(Placeholder.KERNEL_NAME)}_prim_fn"
 
         argdefs, _, signature, _ = self.args.python_argdefs()
 
-        # @T.prim_func parameter list: T.Tensor annotations for tensor args;
-        # numel SizeArgs are closure-captured from the factory function.
         prim_sig_parts: list[str] = []
         for argdef, sig in zip(argdefs, signature):
             if isinstance(sig, TensorArg):
@@ -417,20 +710,17 @@ class TileLangKernel(SIMDKernel):
         code.writeline("):")
 
         with code.indent():
-            # T.Kernel: exactly one block dimension required for NPU.
             code.writeline(
                 "with T.Kernel(T.ceildiv(_xnumel, _XBLOCK), is_npu=True) as (cid, _):"
             )
             with code.indent():
-                # Inputs: T.alloc_shared (UB/cbuf) — supports bulk GM→UB DMA.
+                # ---- allocate input buffers (L1/shared) ----
                 for _, (var, loc, dtype) in self._tl_inputs.items():
                     code.writeline(
                         f"{loc} = T.alloc_shared((_XBLOCK,), '{tilelang_dtype(dtype)}')"
                     )
-                # Outputs: T.alloc_fragment (register file) — supports scalar
-                # writes inside T.Parallel.  Ascend UB (cbuf) does NOT allow
-                # scalar element stores (hivm.hir.store limitation).
-                # After T.Parallel the fragment is copied directly to GM.
+
+                # ---- allocate output buffers (fragment) ----
                 input_locs = {loc for _, loc, _ in self._tl_inputs.values()}
                 for _, (var, loc, dtype) in self._tl_outputs.items():
                     if loc not in input_locs:
@@ -439,46 +729,100 @@ class TileLangKernel(SIMDKernel):
                         )
                 code.writeline("")
 
-                # T.copy GM -> UB for every input.
-                for _, (var, loc, __) in self._tl_inputs.items():
+                # ---- T.copy: GM → L1 for every input ----
+                for _, (var, loc, _) in self._tl_inputs.items():
                     code.writeline(f"T.copy({var}[cid * _XBLOCK], {loc})")
                 code.writeline("")
 
-                # T.Parallel compute body.
-                # Constraint: every buffer subscript is the bare loop variable
-                # _tl_i with no index transformation.
-                code.writeline("for _tl_i in T.Parallel(_XBLOCK):")
-                with code.indent():
-                    loads_s   = self.loads.getvalue().strip()
-                    compute_s = self.compute.getvalue().strip()
-                    stores_s  = self.stores.getvalue().strip()
-                    if loads_s:
-                        code.splice(self.loads)
-                    if compute_s:
-                        code.splice(self.compute)
-                    if stores_s:
-                        code.splice(self.stores)
-                    else:
-                        code.writeline("pass")
+                # ---- emit NPU vector ops ----
+                already_allocated = (
+                    {loc for _, loc, _ in self._tl_inputs.values()}
+                    | {loc for _, loc, _ in self._tl_outputs.values()}
+                )
+                for out_loc, (result_var, dtype) in self._output_vars.items():
+                    ops_list: list[tuple] = []
+                    _build_vec_ops(
+                        result_var, out_loc, ops_list,
+                        self._var_bufs, self._var_ops,
+                    )
+
+                    if not ops_list:
+                        # result_var is a direct input buffer reference (identity)
+                        src = self._var_bufs.get(str(result_var), str(result_var))
+                        if src != out_loc:
+                            code.writeline(f"T.copy({src}, {out_loc})")
+                        continue
+
+                    # Fix the last op to write directly into out_loc
+                    last_op, last_operands, _ = ops_list[-1]
+                    ops_list[-1] = (last_op, last_operands, out_loc)
+
+                    for op_name, operands, out_buf in ops_list:
+                        # Allocate intermediate fragment buffers on first use
+                        if out_buf not in already_allocated:
+                            code.writeline(
+                                f"{out_buf} = T.alloc_fragment((_XBLOCK,), "
+                                f"'{tilelang_dtype(dtype)}')"
+                            )
+                            already_allocated.add(out_buf)
+
+                        op_str = self._emit_vec_op(op_name, operands, out_buf)
+                        code.writeline(op_str)
+
                 code.writeline("")
 
-                # T.copy fragment -> GM for every output.
-                # (T.alloc_fragment → GM direct copy is supported on Ascend.)
-                for _, (var, loc, __) in self._tl_outputs.items():
+                # ---- T.copy: fragment → GM for every output ----
+                for _, (var, loc, _) in self._tl_outputs.items():
                     code.writeline(f"T.copy({loc}, {var}[cid * _XBLOCK])")
 
-        return code.getvalue()
+        src = code.getvalue()
+        print("====== TileLang prim_func ======")
+        print(src)
+        return src
+
+    @staticmethod
+    def _emit_vec_op(op_name: str, operands: list, out_buf: str) -> str:
+        """Return the T.v* call string for one vector operation."""
+        if op_name in _BINARY_VEC_OPS:
+            vec_fn = _BINARY_VEC_OPS[op_name]
+            a = _resolve_operand(operands[0])
+            b = _resolve_operand(operands[1])
+            return f"T.{vec_fn}({a}, {b}, {out_buf})"
+
+        if op_name in _UNARY_VEC_OPS:
+            vec_fn = _UNARY_VEC_OPS[op_name]
+            a = _resolve_operand(operands[0])
+            return f"T.{vec_fn}({a}, {out_buf})"
+
+        # neg: implement as vmul(x, -1.0, out)
+        if op_name == "neg":
+            a = _resolve_operand(operands[0])
+            return f"T.vmul({a}, -1.0, {out_buf})"
+
+        raise NotImplementedError(
+            f"TileLang NPU backend: op '{op_name}' has no T.v* equivalent. "
+            f"This kernel will fall back to Triton."
+        )
 
     def call_kernel(self, name: str, node: Optional[ir.IRNode] = None) -> None:
-        """Emit ``name(tensor_arg0, ..., xnumel)`` in the generated wrapper."""
         wrapper = V.graph.wrapper_code
         _, call_args, signature, _ = self.args.python_argdefs()
         tensor_args = [a for a, s in zip(call_args, signature) if isinstance(s, TensorArg)]
         numel_args  = [str(tree.numel) for tree in self.active_range_trees()]
         wrapper.writeline(f"{name}({', '.join(tensor_args + numel_args)})")
 
-    def create_cse_var(self, *args, **kwargs) -> TileLangCSEVariable:
-        return TileLangCSEVariable(*args, **kwargs)
+    def create_cse_var(self, name, bounds=None, dtype=None) -> TileLangCSEVariable:
+        var = TileLangCSEVariable(name, bounds)
+        if dtype is not None:
+            self._var_dtypes[name] = dtype
+        # Consume any pending op set by TileLangOverrides.*
+        # _pending_op is cleared in load() before load-expr generate calls,
+        # so only compute-expression vars pick it up here.
+        if self._pending_op is not None:
+            op_name, operands = self._pending_op[0], self._pending_op[1]
+            self._var_ops[name] = (op_name, operands)
+            self._pending_op = None
+        return var
 
     def should_use_persistent_reduction(self) -> bool:
         return False
@@ -501,9 +845,7 @@ class TileLangScheduling(SIMDScheduling):
 
     kernel_type: type[Any] = TileLangKernel
 
-    backend_features: OrderedSet[BackendFeature] = OrderedSet(
-        [BackendFeature.INPLACE_BUFFERS]
-    )
+    backend_features: OrderedSet[BackendFeature] = OrderedSet()
 
     @classmethod
     def get_backend_features(cls, device: torch.device) -> OrderedSet[BackendFeature]:
@@ -568,8 +910,6 @@ class TileLangScheduling(SIMDScheduling):
         origins, detailed = get_kernel_metadata(node_schedule, wrapper)
         meta_comment = f"{origins}\n{detailed}".strip()
 
-        # Make tilelang importable in generated output_code.py even without
-        # a pre-configured sys.path.
         tl_pkg_root: Optional[str] = None
         try:
             import tilelang as _tl
@@ -594,7 +934,6 @@ class TileLangScheduling(SIMDScheduling):
         code.writeline(f"import tilelang as {import_alias}")
         code.writeline("")
 
-        # Factory: captures _xnumel as closure variable for the @T.prim_func.
         factory_params = (
             ", ".join(numel_arg_names) if numel_arg_names else "_dummy=None"
         )
