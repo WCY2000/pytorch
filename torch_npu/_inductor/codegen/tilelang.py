@@ -54,7 +54,6 @@ from torch._inductor.codegen.common import (
     CSEVariable,
     IndentedBuffer,
     OpOverrides,
-    SizeArg,
     TensorArg,
 )
 from torch._inductor.codegen.simd import (
@@ -351,7 +350,7 @@ class TileLangKernel(SIMDKernel):
         Register *name* as needing a T.copy (UB → GM) and emit the element
         write into the local shared buffer.
         """
-        if mode == StoreMode.ATOMIC_ADD:
+        if mode == "atomic_add":
             raise NotImplementedError(
                 "TileLang backend: atomic_add store not yet supported"
             )
@@ -424,13 +423,13 @@ class TileLangKernel(SIMDKernel):
             )
             with code.indent():
                 # Allocate UB shared buffers for inputs.
-                for _bn, (var, loc, dtype) in self._tl_inputs.items():
+                for _, (var, loc, dtype) in self._tl_inputs.items():
                     code.writeline(
                         f"{loc} = T.alloc_shared((_XBLOCK,), '{tilelang_dtype(dtype)}')"
                     )
                 # Allocate UB shared buffers for outputs not already used as inputs.
                 input_locs = {loc for _, loc, _ in self._tl_inputs.values()}
-                for _bn, (var, loc, dtype) in self._tl_outputs.items():
+                for _, (var, loc, dtype) in self._tl_outputs.items():
                     if loc not in input_locs:
                         code.writeline(
                             f"{loc} = T.alloc_shared((_XBLOCK,), '{tilelang_dtype(dtype)}')"
@@ -438,7 +437,7 @@ class TileLangKernel(SIMDKernel):
                 code.writeline("")
 
                 # T.copy GM -> UB  (offset form: size inferred from local shape).
-                for _bn, (var, loc, _) in self._tl_inputs.items():
+                for _, (var, loc, __) in self._tl_inputs.items():
                     code.writeline(f"T.copy({var}[cid * _XBLOCK], {loc})")
                 code.writeline("")
 
@@ -461,7 +460,7 @@ class TileLangKernel(SIMDKernel):
                 code.writeline("")
 
                 # T.copy UB -> GM.
-                for _bn, (var, loc, _) in self._tl_outputs.items():
+                for _, (var, loc, __) in self._tl_outputs.items():
                     code.writeline(f"T.copy({loc}, {var}[cid * _XBLOCK])")
 
         return code.getvalue()
