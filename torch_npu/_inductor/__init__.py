@@ -14,7 +14,7 @@ if os.getenv('TORCHINDUCTOR_NPU_BACKEND', 'default') == 'mlir':
         raise ImportError("torch_mlir is not installed, install it first.")
     from .ascend_npu_ir.ascend_npu_ir.npu import npu_inductor_plugin
     from .ascend_npu_ir.ascend_npu_ir.npu import torch_mlir_patch
-    
+
 elif os.getenv('TORCHINDUCTOR_NPU_BACKEND', 'default') == 'dvm':
     from .ascend_npu_ir.ascend_npu_ir.npu import npu_inductor_plugin
     from .dvm import mlir_fusion
@@ -46,7 +46,7 @@ elif os.getenv('TORCHINDUCTOR_NPU_BACKEND', 'default') == 'tilelang':
 
     patch_cache_base_get_system()
     patch_is_gpu()
-    patch_has_triton()
+    patch_has_triton() # inductor 内部用 has_triton() 来决定是否走 SIMD 调度路径
     disable_foreach()
 else:
     import os
@@ -65,7 +65,7 @@ else:
     from . import codegen
     from .fx_passes.pattern_match.npu_fusion_attention_graph import register_fa_pass
     from .config import (
-        aggresive_autotune, num_vector_core, set_compile_threads, 
+        aggresive_autotune, num_vector_core, set_compile_threads,
         disable_comprehensive_padding, max_precompiled_thread_num
     )
     from .config import log as npulog
@@ -146,9 +146,9 @@ else:
         patch_fallback_kernel_codegen()
         patch_aot_code_compiler_compile()
 
-        from .fx_passes.graph_match_pass import pre_grad_custom_pass_fuc 
-        pre_grad_custom_pass_fuc() 
-        from .fx_passes.graph_match_pass import post_grad_custom_pass_fuc 
+        from .fx_passes.graph_match_pass import pre_grad_custom_pass_fuc
+        pre_grad_custom_pass_fuc()
+        from .fx_passes.graph_match_pass import post_grad_custom_pass_fuc
         post_grad_custom_pass_fuc()
 
     if os.environ.get("DISABLE_AOTI_PATCH", "0") != "1":
