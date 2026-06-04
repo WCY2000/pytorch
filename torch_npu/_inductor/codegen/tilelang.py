@@ -272,7 +272,9 @@ class TileLangOverrides(OpOverrides):
     @staticmethod
     def constant(value, dtype: torch.dtype):
         import torch._prims_common as prim
-        return repr(prim.dtype_to_type(dtype)(value))
+        literal = repr(prim.dtype_to_type(dtype)(value))
+        _set_pending("const", [literal])
+        return literal
 
     @staticmethod
     def abs(x):
@@ -527,6 +529,7 @@ def _build_vec_ops(
     ops_list: list,
     var_bufs: dict,
     var_ops: dict,
+    var_consts: Optional[dict] = None,
     _visited: Optional[set] = None,
 ) -> str:
     """
@@ -547,13 +550,16 @@ def _build_vec_ops(
     if var_name in var_bufs:
         return var_bufs[var_name]
 
+    # Constant literal that went through CSE (e.g. tmp1 = 2.0)
+    if var_consts and var_name in var_consts:
+        try:
+            return float(var_consts[var_name])
+        except (ValueError, TypeError):
+            return var_consts[var_name]
+
     # Computed var
     if var_name in var_ops:
         if var_name in _visited:
-            # Already scheduled into ops_list (diamond in the DAG)
-            # Return whatever buf was assigned
-            for _, _, out in ops_list:
-                pass  # find last assignment — use target_buf as hint
             return f"_{var_name}_frag"
 
         _visited.add(var_name)
@@ -563,12 +569,17 @@ def _build_vec_ops(
             op_str = str(op)
             if op_str in var_bufs:
                 resolved.append(var_bufs[op_str])
+            elif var_consts and op_str in var_consts:
+                try:
+                    resolved.append(float(var_consts[op_str]))
+                except (ValueError, TypeError):
+                    resolved.append(var_consts[op_str])
             elif op_str in var_ops:
                 inter_buf = f"_{op_str}_frag"
-                src = _build_vec_ops(op, inter_buf, ops_list, var_bufs, var_ops, _visited)
+                src = _build_vec_ops(op, inter_buf, ops_list, var_bufs, var_ops, var_consts, _visited)
                 resolved.append(src)
             else:
-                # Constant or unknown identifier
+                # Raw literal string (e.g. "2.0" passed directly without going through CSE)
                 try:
                     resolved.append(float(op_str))
                 except (ValueError, TypeError):
@@ -604,6 +615,7 @@ class TileLangKernel(SIMDKernel):
         self._pending_op: Optional[tuple] = None
         self._var_ops:    dict[str, tuple] = {}   # var_name → (op, operands)
         self._var_bufs:   dict[str, str] = {}     # var_name → local_buf_name
+        self._var_consts: dict[str, str] = {}     # var_name → literal string (e.g. "2.0")
         self._var_dtypes: dict[str, torch.dtype] = {}
         self._output_vars: dict[str, tuple] = {}  # local_buf_name → (var, dtype)
 
@@ -743,7 +755,7 @@ class TileLangKernel(SIMDKernel):
                     ops_list: list[tuple] = []
                     _build_vec_ops(
                         result_var, out_loc, ops_list,
-                        self._var_bufs, self._var_ops,
+                        self._var_bufs, self._var_ops, self._var_consts,
                     )
 
                     if not ops_list:
@@ -820,7 +832,10 @@ class TileLangKernel(SIMDKernel):
         # so only compute-expression vars pick it up here.
         if self._pending_op is not None:
             op_name, operands = self._pending_op[0], self._pending_op[1]
-            self._var_ops[name] = (op_name, operands)
+            if op_name == "const":
+                self._var_consts[name] = operands[0]  # e.g. "tmp1" → "2.0"
+            else:
+                self._var_ops[name] = (op_name, operands)
             self._pending_op = None
         return var
 
