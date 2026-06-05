@@ -116,9 +116,9 @@ _BINARY_VEC_OPS: dict[str, tuple[str, frozenset]] = {
     "maximum":     ("vmax", _FP),
     "minimum":     ("vmin", frozenset({torch.float16, torch.float32, torch.bfloat16,
                                        torch.int16, torch.int32, torch.int64})),
-    # vpow: int32 only per hardware docs; only works in pure-int32 kernels because
-    # hivm.hir.vpow is an AIV instruction (vs AIC for vadd/vmul etc.).
-    # Mixing with AIC ops in one kernel causes MLIR verification failure.
+    # vpow: int32 only per hardware docs (fp16/fp32 cause MLIR verification failure).
+    # All T.v* ops including vadd/vmul/vpow lower to AIV instructions, so there is
+    # no AIC/AIV mixing issue; the dtype constraint is the only restriction.
     "pow":         ("vpow", frozenset({torch.int32})),
     "bitwise_and": ("vand", frozenset({torch.int8, torch.int64,
                                        torch.float16, torch.float32, torch.bool})),
