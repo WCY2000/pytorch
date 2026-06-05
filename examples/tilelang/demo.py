@@ -20,12 +20,21 @@ os.environ["TORCHINDUCTOR_NPU_BACKEND"] = "tilelang"
 rtol, atol = 1e-2, 1e-2   # fp32 on NPU; loosen slightly for transcendentals
 
 
+def _show(label, t):
+    flat = t.flatten()
+    vals = flat[:4].tolist()
+    print(f"    {label}: {[f'{v:.4f}' for v in vals]}  "
+          f"mean={flat.mean().item():.4f}  std={flat.std().item():.4f}")
+
+
 def _run(tag, fn, *inputs):
     compiled = torch.compile(fn, backend="inductor")
     ref = fn(*inputs)
     out = compiled(*inputs)
     torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
     err = (out - ref).abs().max().item()
+    _show("ref", ref)
+    _show("out", out)
     print(f"  PASS  max_err = {err:.6f}  [{tag}]")
 
 
@@ -157,6 +166,8 @@ def test_softmax():
     ref = my_softmax(x)
     out = compiled(x)
     torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
+    _show("ref", ref)
+    _show("out", out)
     print(f"  PASS  max_err = {(out - ref).abs().max().item():.6f}  [Mixed]")
 
 
@@ -174,6 +185,8 @@ def test_softmax_temperature():
     ref = my_softmax(x, temperature=0.5)
     out = compiled(x, temperature=0.5)
     torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
+    _show("ref", ref)
+    _show("out", out)
     print(f"  PASS  max_err = {(out - ref).abs().max().item():.6f}  [Mixed]")
 
 
@@ -200,6 +213,8 @@ def test_layer_norm_affine():
     ref = fn(x, w, b)
     out = compiled(x, w, b)
     torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
+    _show("ref", ref)
+    _show("out", out)
     print(f"  PASS  max_err = {(out - ref).abs().max().item():.6f}  [Mixed]")
 
 
