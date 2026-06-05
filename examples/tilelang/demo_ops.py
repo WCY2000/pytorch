@@ -3,7 +3,8 @@ TileLang inductor backend — exhaustive op coverage demo.
 
 Tests every op that has a T.v* mapping in tilelang.py:
 
-  _BINARY_VEC_OPS:  add vsub vmul vdiv vmax vmin vpow  (+ scalar-const variants)
+  _BINARY_VEC_OPS:  add vsub vmul vdiv vmax vmin  (+ scalar-const variants)
+                    pow removed: hivm.hir.vpow not supported on this device
   _UNARY_VEC_OPS:   vexp vln vexp2 vlog2 vrelu vsigmoid vsqrt vrsqrt vabs
                     vcos vsin verf vtanh
   special:          neg (→ vmul x -1.0)
@@ -65,7 +66,7 @@ _check("mul      x*y",      lambda x, y: x * y,                  x, y)
 _check("truediv  x/yp",     lambda x, y: x / y,                  x, yp)
 _check("maximum  max(x,y)", lambda x, y: torch.maximum(x, y),    x, y)
 _check("minimum  min(x,y)", lambda x, y: torch.minimum(x, y),    x, y)
-_check("pow      xp**yp",   lambda x, y: torch.pow(x, y),        xp, yp)
+# pow: hivm.hir.vpow not supported on Ascend AIC core → Triton fallback
 
 
 # ===========================================================================
@@ -77,8 +78,7 @@ _check("add      x+2.0",    lambda x: x + 2.0,                   x)
 _check("sub      x-0.5",    lambda x: x - 0.5,                   x)
 _check("mul      x*3.0",    lambda x: x * 3.0,                   x)
 _check("truediv  x/4.0",    lambda x: x / 4.0,                   x)
-_check("pow      xp**2.0",  lambda x: torch.pow(x, 2.0),         xp)
-_check("pow      xp**0.5",  lambda x: torch.pow(x, 0.5),         xp)
+# pow scalar: same reason, Triton fallback
 
 
 # ===========================================================================

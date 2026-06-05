@@ -118,7 +118,6 @@ _BINARY_VEC_OPS: dict[str, str] = {
     "truediv":     "vdiv",
     "maximum":     "vmax",
     "minimum":     "vmin",
-    "pow":         "vpow",
     "bitwise_and": "vand",
     "bitwise_or":  "vor",
     "bitwise_xor": "vxor",
