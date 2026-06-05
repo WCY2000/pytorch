@@ -17,7 +17,7 @@ Generated kernel structure:
     ):
         with T.Kernel(T.ceildiv(_xnumel, _XBLOCK), is_npu=True) as (cid, _):
             _in_ptr0_local  = T.alloc_shared((_XBLOCK,), 'float32')  # L1/UB
-            _out_ptr0_local = T.alloc_fragment((_XBLOCK,), 'float32') # fragment
+            _out_ptr0_local = T.alloc_shared((_XBLOCK,), 'float32') # fragment
             T.copy(in_ptr0[cid * _XBLOCK], _in_ptr0_local)  # GM -> L1
             T.vadd(_in_ptr0_local, _in_ptr1_local, _out_ptr0_local)  # vector op
             T.copy(_out_ptr0_local, out_ptr0[cid * _XBLOCK])  # fragment -> GM
@@ -721,7 +721,7 @@ class TileLangKernel(SIMDKernel):
 
         prim_sig_parts: list[str] = []
         for argdef, sig in zip(argdefs, signature):
-            if isinstance(sig, TensorArg):
+            if isinstance(sig, TensoprArg):
                 prim_sig_parts.append(
                     f"{argdef.name}: T.Tensor((_xnumel,), '{tilelang_dtype(sig.dtype)}')"
                 )
@@ -755,7 +755,7 @@ class TileLangKernel(SIMDKernel):
                 for _, (var, loc, dtype) in self._tl_outputs.items():
                     if loc not in input_locs:
                         code.writeline(
-                            f"{loc} = T.alloc_fragment((_XBLOCK,), '{tilelang_dtype(dtype)}')"
+                            f"{loc} = T.alloc_shared((_XBLOCK,), '{tilelang_dtype(dtype)}')"
                         )
                 code.writeline("")
 
@@ -791,7 +791,7 @@ class TileLangKernel(SIMDKernel):
                         # Allocate intermediate fragment buffers on first use
                         if out_buf not in already_allocated:
                             code.writeline(
-                                f"{out_buf} = T.alloc_fragment((_XBLOCK,), "
+                                f"{out_buf} = T.alloc_shared((_XBLOCK,), "
                                 f"'{tilelang_dtype(dtype)}')"
                             )
                             already_allocated.add(out_buf)
