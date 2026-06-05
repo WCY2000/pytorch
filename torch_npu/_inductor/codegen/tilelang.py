@@ -78,8 +78,6 @@ from torch._inductor.virtualized import ReductionType, StoreMode, V
 # dtype helpers
 # ---------------------------------------------------------------------------
 
-_TILELANG_UB_DTYPES: frozenset[torch.dtype] = frozenset({torch.float16, torch.float32})
-
 _TORCH_TO_TL_DTYPE: dict[torch.dtype, str] = {
     torch.float16:  "float16",
     torch.bfloat16: "bfloat16",
@@ -98,47 +96,60 @@ def tilelang_dtype(dtype: torch.dtype) -> str:
     return _TORCH_TO_TL_DTYPE.get(dtype, "float32")
 
 
-def _assert_ub_dtype(name: str, dtype: torch.dtype) -> None:
-    if dtype not in _TILELANG_UB_DTYPES:
-        raise NotImplementedError(
-            f"TileLang backend: Ascend UB supports float16/float32 only; "
-            f"buffer '{name}' has dtype {dtype}."
-        )
-
-
 # ---------------------------------------------------------------------------
-# NPU vector op mappings
+# NPU vector op mappings  (op_name → (tilelang_fn, supported_dtypes))
+#
+# Dtype support sourced from tilelang-mlir-ascend/docs/Tilelang.language/
+# Only dtypes reachable through inductor (no uint16 / uint32 / float64 paths).
 # ---------------------------------------------------------------------------
 
-# Binary vector ops: T.vXXX(A, B, C)  where B may be a scalar float/int
-_BINARY_VEC_OPS: dict[str, str] = {
-    "add":         "vadd",
-    "sub":         "vsub",
-    "mul":         "vmul",
-    "truediv":     "vdiv",
-    "maximum":     "vmax",
-    "minimum":     "vmin",
-    "bitwise_and": "vand",
-    "bitwise_or":  "vor",
-    "bitwise_xor": "vxor",
+_FP      = frozenset({torch.float16, torch.float32})
+_FP_INT  = frozenset({torch.float16, torch.float32,
+                      torch.int16, torch.int32, torch.int64})
+
+# Binary vector ops: T.vXXX(A, B, C)  where B may be a scalar
+_BINARY_VEC_OPS: dict[str, tuple[str, frozenset]] = {
+    "add":         ("vadd", _FP),
+    "sub":         ("vsub", _FP),
+    "mul":         ("vmul", _FP_INT),
+    "truediv":     ("vdiv", frozenset({torch.float16, torch.float32, torch.int64})),
+    "maximum":     ("vmax", _FP),
+    "minimum":     ("vmin", frozenset({torch.float16, torch.float32, torch.bfloat16,
+                                       torch.int16, torch.int32, torch.int64})),
+    # vpow: int32 only per hardware docs; only works in pure-int32 kernels because
+    # hivm.hir.vpow is an AIV instruction (vs AIC for vadd/vmul etc.).
+    # Mixing with AIC ops in one kernel causes MLIR verification failure.
+    "pow":         ("vpow", frozenset({torch.int32})),
+    "bitwise_and": ("vand", frozenset({torch.int8, torch.int64,
+                                       torch.float16, torch.float32, torch.bool})),
+    "bitwise_or":  ("vor",  frozenset()),   # uint16 only — not reachable via inductor
+    "bitwise_xor": ("vxor", frozenset()),   # same
 }
 
 # Unary vector ops: T.vXXX(A, B)
-_UNARY_VEC_OPS: dict[str, str] = {
-    "exp":     "vexp",
-    "log":     "vln",
-    "exp2":    "vexp2",
-    "log2":    "vlog2",
-    "relu":    "vrelu",
-    "sigmoid": "vsigmoid",
-    "sqrt":    "vsqrt",
-    "rsqrt":   "vrsqrt",
-    "abs":     "vabs",
-    "cos":     "vcos",
-    "sin":     "vsin",
-    "erf":     "verf",
-    "tanh":    "vtanh",
+_UNARY_VEC_OPS: dict[str, tuple[str, frozenset]] = {
+    "exp":     ("vexp",     _FP),
+    "log":     ("vln",      _FP),
+    "exp2":    ("vexp2",    _FP),
+    "log2":    ("vlog2",    _FP),
+    "relu":    ("vrelu",    _FP),
+    "sigmoid": ("vsigmoid", _FP),
+    "sqrt":    ("vsqrt",    _FP),
+    "rsqrt":   ("vrsqrt",   _FP),
+    "abs":     ("vabs",     frozenset({torch.float16, torch.float32,
+                                       torch.uint8, torch.int32, torch.int64})),
+    "cos":     ("vcos",     _FP),
+    "sin":     ("vsin",     _FP),
+    "erf":     ("verf",     _FP),
+    "tanh":    ("vtanh",    _FP),
 }
+
+# Union of all dtypes supported by at least one op — used as early gate in load().
+_ANY_SUPPORTED_DTYPE: frozenset[torch.dtype] = frozenset().union(
+    *[s for _, s in _BINARY_VEC_OPS.values()],
+    *[s for _, s in _UNARY_VEC_OPS.values()],
+    {torch.float16, torch.float32},   # always include for neg (vmul fallback)
+)
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +654,11 @@ class TileLangKernel(SIMDKernel):
 
     def load(self, name: str, index: sympy.Expr) -> TileLangCSEVariable:
         dtype = V.graph.get_dtype(name)
-        _assert_ub_dtype(name, dtype)
+        if dtype not in _ANY_SUPPORTED_DTYPE:
+            raise NotImplementedError(
+                f"TileLang backend: no T.v* op supports dtype {dtype} "
+                f"(buffer '{name}'); falling back to Triton."
+            )
         var = self.args.input(name)
         local_name = f"_{var}_local"
         if name not in self._tl_inputs:
@@ -668,11 +683,15 @@ class TileLangKernel(SIMDKernel):
                 "TileLang backend: atomic_add store not yet supported"
             )
         dtype = V.graph.get_dtype(name)
-        _assert_ub_dtype(name, dtype)
         var = self.args.output(name)
         local_name = f"_{var}_local"
         if name not in self._tl_outputs:
             self._tl_outputs[name] = (var, local_name, dtype)
+        # Check that every op in the compute graph supports this output dtype.
+        # This is the right place to check: all loads/overrides have already run,
+        # so _var_ops/_var_consts are fully populated. NotImplementedError here
+        # propagates through _body() and triggers inductor's Triton fallback.
+        self._check_op_graph_dtype(str(value), dtype)
         # Record: local_name should be filled with the result of `value`
         self._output_vars[local_name] = (value, dtype)
         # Keep scalar emit for debugging / non-NPU paths
@@ -791,17 +810,66 @@ class TileLangKernel(SIMDKernel):
         print(src)
         return src
 
+    def _check_op_graph_dtype(
+        self,
+        var_name: str,
+        dtype: torch.dtype,
+        _visited: Optional[set] = None,
+    ) -> None:
+        """
+        Walk the op graph from var_name and raise NotImplementedError if any
+        op does not support `dtype`.  Called from store() so it executes
+        inside _body(*index_vars) and triggers inductor's Triton fallback.
+        """
+        if _visited is None:
+            _visited = set()
+        if var_name in _visited:
+            return
+        _visited.add(var_name)
+
+        if var_name not in self._var_ops:
+            return  # input buffer or constant — no op to check
+
+        op_name, operands = self._var_ops[var_name]
+
+        if op_name in _BINARY_VEC_OPS:
+            _, supported = _BINARY_VEC_OPS[op_name]
+            if dtype not in supported:
+                raise NotImplementedError(
+                    f"TileLang NPU: op '{op_name}' (T.{_BINARY_VEC_OPS[op_name][0]}) "
+                    f"does not support dtype {dtype}; supported: {supported}. "
+                    f"Falling back to Triton."
+                )
+        elif op_name in _UNARY_VEC_OPS:
+            _, supported = _UNARY_VEC_OPS[op_name]
+            if dtype not in supported:
+                raise NotImplementedError(
+                    f"TileLang NPU: op '{op_name}' (T.{_UNARY_VEC_OPS[op_name][0]}) "
+                    f"does not support dtype {dtype}; supported: {supported}. "
+                    f"Falling back to Triton."
+                )
+        elif op_name == "neg":
+            _, supported = _BINARY_VEC_OPS["mul"]
+            if dtype not in supported:
+                raise NotImplementedError(
+                    f"TileLang NPU: neg (→vmul×-1) does not support dtype {dtype}. "
+                    f"Falling back to Triton."
+                )
+
+        for op in operands:
+            self._check_op_graph_dtype(str(op), dtype, _visited)
+
     @staticmethod
     def _emit_vec_op(op_name: str, operands: list, out_buf: str) -> str:
         """Return the T.v* call string for one vector operation."""
         if op_name in _BINARY_VEC_OPS:
-            vec_fn = _BINARY_VEC_OPS[op_name]
+            vec_fn, _ = _BINARY_VEC_OPS[op_name]
             a = _resolve_operand(operands[0])
             b = _resolve_operand(operands[1])
             return f"T.{vec_fn}({a}, {b}, {out_buf})"
 
         if op_name in _UNARY_VEC_OPS:
-            vec_fn = _UNARY_VEC_OPS[op_name]
+            vec_fn, _ = _UNARY_VEC_OPS[op_name]
             a = _resolve_operand(operands[0])
             return f"T.{vec_fn}({a}, {out_buf})"
 
