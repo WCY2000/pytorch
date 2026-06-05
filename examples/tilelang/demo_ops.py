@@ -178,15 +178,23 @@ _check("exp_add fp16  exp(x)+x",
        lambda x: torch.exp(x) + x,                                 x16)
 
 print("\n========== Fused chains (int32) ==========")
-
-_check("mul_add int32  x*y+z",
-       lambda x, y, z: x * y + z,                                  xi32, yi32, xi32)
+# int32 supported ops: vmul, vabs, vneg, vmin, vpow
+# NOT supported: vadd, vsub, vmax, vdiv (fp16/fp32 only for those)
 
 _check("abs_mul int32  abs(x)*2",
        lambda x: torch.abs(x) * 2,                                  xi32)
 
+_check("neg_mul int32  (-x)*y",
+       lambda x, y: (-x) * y,                                       xi32, yi32)
+
 _check("pow_mul int32  x**2 * y",
        lambda x, y: torch.pow(x, 2) * y,                           xi32, yi32)
+
+_check("abs_min int32  min(abs(x),y)",
+       lambda x, y: torch.minimum(torch.abs(x), y),                xi32, yi32)
+
+_check("mul_mul int32  x*y*2",
+       lambda x, y: x * y * 2,                                      xi32, yi32)
 
 
 # ===========================================================================
