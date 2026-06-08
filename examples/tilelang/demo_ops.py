@@ -214,6 +214,53 @@ _check("relu 2D fp16",      lambda x: torch.relu(x),        x2h)
 
 
 # ===========================================================================
+# Reductions — persistent (rnumel fits in SRAM)
+#
+# The inductor TileLang backend prints the generated @T.prim_func source to
+# stdout when it compiles a reduction kernel, so each test below will also
+# show the raw TileLang code that was produced.
+#
+# Layout:
+#   Grid  = xnumel  (one AI Core per output element)
+#   Input = T.alloc_shared((N,), dtype)       loaded via T.copy(ptr[cid*N], buf, size=[N])
+#   Reduce= T.reduce(src, dst, dims=0, reduce_mode='sum'|'max'|…, clear=True)
+#   Output= T.alloc_fragment((1,), dtype)     stored via T.copy(buf, ptr[cid], size=[1])
+# ===========================================================================
+print("\n========== Reductions (persistent, fp32) ==========")
+
+# Small N so the full row fits in L1 (< 4 KB for fp32)
+M, N = 64, 128
+xr  = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
+xr16 = torch.randn(M, N, device=DEVICE, dtype=torch.float16)
+
+_check("sum  2D fp32  dim=1 keepdim",
+       lambda x: x.sum(dim=1, keepdim=True),   xr)
+
+_check("sum  2D fp16  dim=1 keepdim",
+       lambda x: x.sum(dim=1, keepdim=True),   xr16)
+
+_check("sum  2D fp32  dim=1 no keepdim",
+       lambda x: x.sum(dim=1),                  xr)
+
+_check("max  2D fp32  dim=1 keepdim",
+       lambda x: x.max(dim=1, keepdim=True).values,  xr)
+
+_check("min  2D fp32  dim=1 keepdim",
+       lambda x: x.min(dim=1, keepdim=True).values,  xr)
+
+_check("mean 2D fp32  dim=1 keepdim",
+       lambda x: x.mean(dim=1, keepdim=True),   xr)
+
+print("\n========== Reductions (persistent, larger N) ==========")
+
+M2, N2 = 32, 256
+xr2 = torch.randn(M2, N2, device=DEVICE, dtype=torch.float16)
+
+_check("sum  32x512 fp32  dim=1",
+       lambda x: x.sum(dim=1, keepdim=True),   xr2)
+
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 total = PASS_COUNT + FAIL_COUNT

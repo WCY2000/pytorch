@@ -601,17 +601,20 @@ def _build_vec_ops(
     return var_name
 
 
-# TileLang reduction op names (ReductionType string → T.* function name)
+# TileLang reduction mode strings for T.reduce(src, dst, dims=N, reduce_mode=...)
 _REDUCE_OPS: dict[str, str] = {
-    "sum":     "reduce_sum",
-    "max":     "reduce_max",
-    "min":     "reduce_min",
-    "any":     "reduce_or",
-    "prod":    "reduce_prod",
-    "xor_sum": "reduce_xor",
-    "argmax":  "reduce_max",   # index extraction handled separately
-    "argmin":  "reduce_min",
+    "sum":     "sum",
+    "max":     "max",
+    "min":     "min",
+    "any":     "sum",   # bool-sum approximation
+    "prod":    "prod",
+    "xor_sum": "xor",
 }
+
+# Rows processed per AI Core in a reduction kernel.
+# Must be > 1 to produce a vector DMA for the output copy (hivm.hir.nd2nz
+# doesn't support single-element cbuf→GM transfers via hivm.hir.store).
+_REDUCTION_ROW_BLOCK = 32
 
 
 class TileLangKernel(NPUIndexTritonKernel):
@@ -739,6 +742,26 @@ class TileLangKernel(NPUIndexTritonKernel):
         self._var_ops[result_var.name] = ("reduce", rt, str(value))
         self.outside_loop_vars.add(result_var)
         return result_var
+
+    # ------------------------------------------------------------------
+    # Block codegen_body / write_scalar so the parent's Triton loop
+    # emitter never runs.  TileLang generates everything fresh inside
+    # codegen_kernel(); kernel.body is never read.
+    # ------------------------------------------------------------------
+
+    def codegen_body(self) -> None:
+        # Flush CSE outside-loop-vars so reuse works across nodes, but do
+        # NOT emit any Triton loop code into self.body.
+        self.cse.invalidate(self.outside_loop_vars)
+        self.loads.clear()
+        self.compute.clear()
+        self.stores.clear()
+        self.post_loop_store.clear()
+        self.prefix.clear()
+        self.first_node = False
+
+    def write_scalar(self) -> None:
+        pass  # no scalar Triton emit needed
 
     # ------------------------------------------------------------------
     # Index offset helpers
@@ -929,13 +952,18 @@ class TileLangKernel(NPUIndexTritonKernel):
 
     def _codegen_reduction_kernel(self, name: Optional[str] = None) -> str:
         """
-        Emit a TileLang persistent-reduction kernel.
+        Emit a TileLang persistent-reduction kernel following the reference pattern:
 
-        Layout:
-          Grid  = xnumel  (one AI Core per output element)
-          Input = T.copy(in_ptr[cid * _rnumel], _in_local)  size=rnumel
-          Reduce= T.reduce_{op}(_in_local, _out_local, dim=0)
-          Output= T.copy(_out_local, out_ptr[cid])
+          Grid  = ceildiv(xnumel, _ROW_BLOCK)   one tile per _ROW_BLOCK output rows
+          Input = T.alloc_shared((_ROW_BLOCK, _rnumel), ...)  2-D block
+          Output= T.alloc_fragment((_ROW_BLOCK, 1), ...)      2-D result
+          Load  : T.copy(in_ptr[cid * _ROW_BLOCK, 0], _in_local)
+          Reduce: T.reduce(_in_local, _out_local, dims=1, reduce_mode=..., clear=True)
+          Store : T.copy(_out_local, out_ptr[cid * _ROW_BLOCK, 0])
+
+        Using _ROW_BLOCK > 1 ensures the output T.copy transfers _ROW_BLOCK
+        elements (vector DMA), avoiding the single-element hivm.hir.store that
+        the hardware does not support for cbuf→GM transfers.
 
         Non-persistent reduction raises NotImplementedError (→ Triton fallback).
         """
@@ -947,40 +975,46 @@ class TileLangKernel(NPUIndexTritonKernel):
 
         prim_fn_name = f"{name or str(Placeholder.KERNEL_NAME)}_prim_fn"
         argdefs, _, signature, _ = self.args.python_argdefs()
-        prim_sig_parts = self._prim_sig_parts(argdefs, signature)
 
-        x_syms, r_syms = self._axis_syms()
-        _cid  = sympy.Symbol("cid")
-        _zero = sympy.Integer(0)
+        # 2-D tensor signatures:
+        #   reduction inputs  → (_xnumel, _rnumel)
+        #   reduction outputs → (_xnumel, 1)
+        input_vars  = {v for _, (v, _, _) in self._tl_inputs.items()}
+        prim_sig_parts: list[str] = []
+        for argdef, sig in zip(argdefs, signature):
+            if not isinstance(sig, TensorArg):
+                continue
+            dtype_str = tilelang_dtype(sig.dtype)
+            if argdef.name in input_vars:
+                prim_sig_parts.append(
+                    f"{argdef.name}: T.Tensor((_xnumel, _rnumel), '{dtype_str}')"
+                )
+            else:
+                prim_sig_parts.append(
+                    f"{argdef.name}: T.Tensor((_xnumel, 1), '{dtype_str}')"
+                )
 
-        # Determine r_numel as a code string
+        # Determine r_numel as a code-time string (static int or _rnumel closure var)
+        _, r_syms = self._axis_syms()
         r_nodes = list(r_syms.values())
         if r_nodes:
             simplified = V.graph.sizevars.simplify(r_nodes[0].length)
-            r_numel_str = str(int(simplified)) if isinstance(simplified, (sympy.Integer, int)) else "_rnumel"
+            r_numel_str = (
+                str(int(simplified))
+                if isinstance(simplified, (sympy.Integer, int))
+                else "_rnumel"
+            )
         else:
             r_numel_str = "1"
 
-        # Substitution maps for input/output offset computation
-        x_to_grid = {s: _cid for s in x_syms}
-        r_to_zero = {s: _zero for s in r_syms}
-
-        def in_offset(nm):
-            idx = self._tl_input_indices.get(nm)
-            if idx is None:
-                return f"cid * {r_numel_str}"
-            return self._build_copy_offset(idx, x_syms, r_syms, {**x_to_grid, **r_to_zero}, _zero)
-
-        def out_offset(nm):
-            idx = self._tl_output_indices.get(nm)
-            if idx is None:
-                return "cid"
-            return self._build_copy_offset(idx, x_syms, r_syms, {**x_to_grid, **r_to_zero}, _zero)
+        row_block = _REDUCTION_ROW_BLOCK  # rows per core
 
         # ---- assemble prim_func ----
         code = IndentedBuffer()
         code.writeline("import tilelang.language as T")
         code.writeline("import math as _math")
+        code.writeline("")
+        code.writeline(f"_ROW_BLOCK = {row_block}")
         code.writeline("")
         code.writeline("@T.prim_func")
         code.writeline(f"def {prim_fn_name}(")
@@ -990,26 +1024,44 @@ class TileLangKernel(NPUIndexTritonKernel):
         code.writeline("):")
 
         with code.indent():
-            code.writeline("with T.Kernel(_xnumel, is_npu=True) as (cid, _):")
+            code.writeline(
+                f"with T.Kernel(T.ceildiv(_xnumel, _ROW_BLOCK), is_npu=True) as (cid, _):"
+            )
             with code.indent():
-                # allocate input (full r-dim per core)
+                # ---- allocate buffers ----
+                # Input: 2-D block (_ROW_BLOCK rows × _rnumel cols)
                 for nm, (var, loc, dtype) in self._tl_inputs.items():
-                    code.writeline(f"{loc} = T.alloc_shared(({r_numel_str},), '{tilelang_dtype(dtype)}')")
+                    code.writeline(
+                        f"{loc} = T.alloc_shared((_ROW_BLOCK, {r_numel_str}), "
+                        f"'{tilelang_dtype(dtype)}')"
+                    )
 
-                # allocate output (scalar per core)
+                # Output: 2-D shared (_ROW_BLOCK rows × 1 col) in cbuf (UB).
+                # Key constraint: T.alloc_shared → cbuf (= UB address space).
+                #   • T.alloc_fragment → zero address space: hivm.hir.store
+                #     does NOT support zero→gm.
+                #   • T.alloc_shared with 1 element (4 B): too small for DMA
+                #     alignment → also generates a scalar hivm.hir.store that fails.
+                #   • T.alloc_shared with _ROW_BLOCK×1 elements (128 B for fp32):
+                #     satisfies DMA alignment → hivm.hir.store: ub→gm succeeds.
                 input_locs = {loc for _, loc, _ in self._tl_inputs.values()}
                 for nm, (var, loc, dtype) in self._tl_outputs.items():
                     if loc not in input_locs:
-                        code.writeline(f"{loc} = T.alloc_shared((1,), '{tilelang_dtype(dtype)}')")
+                        code.writeline(
+                            f"{loc} = T.alloc_shared((_ROW_BLOCK, 1), "
+                            f"'{tilelang_dtype(dtype)}')"
+                        )
                 code.writeline("")
 
-                # GM → L1: load full reduction slice
+                # ---- GM → L1: load _ROW_BLOCK rows ----
                 for nm, (var, loc, _) in self._tl_inputs.items():
-                    off = in_offset(nm)
-                    code.writeline(f"T.copy({var}[{off}], {loc})")
+                    code.writeline(
+                        f"T.copy({var}[cid * _ROW_BLOCK, 0], {loc}, "
+                        f"size=[_ROW_BLOCK, {r_numel_str}])"
+                    )
                 code.writeline("")
 
-                # Reduction ops
+                # ---- reduction ops ----
                 already_allocated: set = (
                     {loc for _, loc, _ in self._tl_inputs.values()}
                     | {loc for _, loc, _ in self._tl_outputs.values()}
@@ -1021,17 +1073,28 @@ class TileLangKernel(NPUIndexTritonKernel):
                         if op_entry[0] == "reduce":
                             _, rt, in_var_str = op_entry
                             src_buf = self._var_bufs.get(in_var_str, f"_{in_var_str}_local")
-                            tl_fn = _REDUCE_OPS.get(rt, "reduce_sum")
-                            code.writeline(f"T.{tl_fn}({src_buf}, {out_loc}, dim=0)")
+                            reduce_mode = _REDUCE_OPS.get(rt, "sum")
+                            code.writeline(
+                                f"T.reduce({src_buf}, {out_loc}, "
+                                f"dims=1, reduce_mode='{reduce_mode}', clear=True)"
+                            )
                     else:
                         # pointwise epilogue fused with reduction output
-                        self._emit_vec_ops_block(code, out_loc, result_var, dtype, already_allocated, "1")
+                        self._emit_vec_ops_block(
+                            code, out_loc, result_var, dtype, already_allocated,
+                            f"_ROW_BLOCK, 1"
+                        )
                 code.writeline("")
 
-                # L1 → GM: store scalar result
+                # ---- L1 → GM: store _ROW_BLOCK results ----
+                # Explicit size= ensures TileLang generates a proper DMA
+                # (hivm.hir.nd2nz/hivm.hir.store ub→gm) rather than falling
+                # back to element-wise memref.copy for the output slice.
                 for nm, (var, loc, _) in self._tl_outputs.items():
-                    off = out_offset(nm)
-                    code.writeline(f"T.copy({loc}, {var}[{off}])")
+                    code.writeline(
+                        f"T.copy({loc}, {var}[cid * _ROW_BLOCK, 0], "
+                        f"size=[_ROW_BLOCK, 1])"
+                    )
 
         src = code.getvalue()
         print("====== TileLang reduction prim_func ======")
@@ -1151,7 +1214,16 @@ class TileLangScheduling(NPUTritonScheduling):
     Activated via ``TORCHINDUCTOR_NPU_BACKEND=tilelang``.
     """
 
+    # Class-level default; __init__ overrides the instance attribute that
+    # NPUTritonScheduling.__init__ would otherwise set to NPUIndexTritonKernel.
     kernel_type: type[Any] = TileLangKernel
+
+    def __init__(self, input_scheduler) -> None:
+        super().__init__(input_scheduler)
+        # NPUTritonScheduling.__init__ sets self.kernel_type = NPUIndexTritonKernel
+        # as an instance attribute, which shadows the class attribute above.
+        # Re-set it here so create_kernel_choices uses TileLangKernel.
+        self.kernel_type = TileLangKernel
 
     def codegen_sync(self) -> None:
         V.graph.wrapper_code.writeline("torch.npu.synchronize()")
@@ -1274,4 +1346,6 @@ class TileLangScheduling(NPUTritonScheduling):
             code.writeline(f"{cache_var}[_key]({', '.join(tensor_call_args)})")
 
         wrapper.header.splice(code.getvalue())
+        print("<<< src_code")
+        print(src_code)
         return kernel_name, src_code
