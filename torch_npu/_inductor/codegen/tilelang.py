@@ -49,11 +49,8 @@ from typing import Any, Optional
 
 import sympy
 import torch
-from torch.utils._ordered_set import OrderedSet
-
 from torch._inductor import config, ir
 from torch._inductor.codegen.common import (
-    BackendFeature,
     CSE,
     CSEVariable,
     IndentedBuffer,
@@ -62,7 +59,6 @@ from torch._inductor.codegen.common import (
 )
 from torch._inductor.codegen.simd import (
     SIMDKernel,
-    SIMDScheduling,
     IterationRangesRoot,
     IterationRangesEntry,
 )
@@ -72,6 +68,10 @@ from torch._inductor.codegen.triton import (
 )
 from torch._inductor.utils import Placeholder
 from torch._inductor.virtualized import ReductionType, StoreMode, V
+
+# NPU-specific imports — resolved at class definition time to avoid circulars
+from .triton import NPUIndexTritonKernel
+from .scheduling import NPUTritonScheduling
 
 
 # ---------------------------------------------------------------------------
@@ -601,25 +601,46 @@ def _build_vec_ops(
     return var_name
 
 
-class TileLangKernel(SIMDKernel):
-    """
-    Generates a TileLang @T.prim_func body for a fused set of pointwise nodes.
+# TileLang reduction op names (ReductionType string → T.* function name)
+_REDUCE_OPS: dict[str, str] = {
+    "sum":     "reduce_sum",
+    "max":     "reduce_max",
+    "min":     "reduce_min",
+    "any":     "reduce_or",
+    "prod":    "reduce_prod",
+    "xor_sum": "reduce_xor",
+    "argmax":  "reduce_max",   # index extraction handled separately
+    "argmin":  "reduce_min",
+}
 
-    Uses NPU vector intrinsics (T.vadd, T.vexp, ...) instead of T.Parallel
-    scalar loops — scalar element-wise stores to Ascend L1 (cbuf) are not
-    supported by the BiShengHIR pipeline.
+
+class TileLangKernel(NPUIndexTritonKernel):
+    """
+    Generates a TileLang @T.prim_func body for fused pointwise and reduction
+    nodes targeting Ascend NPU.
+
+    Inherits NPUIndexTritonKernel so that NPUTritonScheduling can run
+    decide_codegen_dims_in_kernel (SplitTiling / ReductionAnalysis) on this
+    kernel before codegen, populating split_axis / tiling_axis / sorted_axis.
+
+    codegen_kernel() then uses that axis metadata to emit correct multi-dim
+    T.copy offsets and T.reduce calls instead of Triton tl.* primitives.
     """
 
     overrides = TileLangOverrides  # type: ignore[assignment]
     kexpr = SIMDKernel.sexpr       # type: ignore[assignment]
 
     def __init__(self, tiling: dict, **kwargs) -> None:
-        super().__init__(tiling, **kwargs)
+        super().__init__(tiling=tiling, **kwargs)
+        # Override with plain CSE so create_cse_var returns TileLangCSEVariable.
         self.cse: CSE = CSE(self.newvar_prefix, self.suffix)
 
         # Buffer registry
         self._tl_inputs:  dict[str, tuple[str, str, torch.dtype]] = {}
         self._tl_outputs: dict[str, tuple[str, str, torch.dtype]] = {}
+        # Sympy index expression recorded at first load/store of each buffer
+        self._tl_input_indices:  dict[str, sympy.Expr] = {}
+        self._tl_output_indices: dict[str, sympy.Expr] = {}
 
         # Op graph (built during load/store/overrides calls)
         self._pending_op: Optional[tuple] = None
@@ -628,25 +649,22 @@ class TileLangKernel(SIMDKernel):
         self._var_consts: dict[str, str] = {}     # var_name → literal string (e.g. "2.0")
         self._var_dtypes: dict[str, torch.dtype] = {}
         self._output_vars: dict[str, tuple] = {}  # local_buf_name → (var, dtype)
+        self._is_reduction_output: dict[str, bool] = {}  # local_buf_name → bool
 
     # ------------------------------------------------------------------
-    # SIMDKernel abstract interface
+    # SIMDKernel / NPUIndexTritonKernel interface overrides
     # ------------------------------------------------------------------
 
     def dtype_to_str(self, dtype: torch.dtype) -> str:
         return tilelang_dtype(dtype)
 
-    def codegen_iteration_ranges_entry(self, entry: IterationRangesEntry) -> None:
-        pass
+    def should_use_persistent_reduction(self) -> bool:
+        # Always use persistent reduction — non-persistent raises NotImplementedError
+        # in _codegen_reduction_kernel so the caller falls back to Triton.
+        return True
 
-    def iteration_ranges_get_pid(self, entry: IterationRangesRoot) -> str:
-        return "cid"
-
-    def iteration_ranges_ranges_code(self, entry: IterationRangesRoot) -> str:
-        return f"T.arange(0, {entry.prefix.upper()}BLOCK)"
-
-    def iteration_ranges_scalar_code(self, entry: IterationRangesRoot, value: Any) -> str:
-        return repr(value)
+    def should_use_cooperative_reduction(self) -> bool:
+        return False
 
     # ------------------------------------------------------------------
     # load / store / reduction
@@ -663,10 +681,10 @@ class TileLangKernel(SIMDKernel):
         local_name = f"_{var}_local"
         if name not in self._tl_inputs:
             self._tl_inputs[name] = (var, local_name, dtype)
-        # Clear any stale _pending_op so load vars are never mis-attributed.
+            self._tl_input_indices[name] = index
+        # Clear stale _pending_op so load vars are never mis-attributed.
         self._pending_op = None
         cse_var = self.cse.generate(self.loads, f"{local_name}[_tl_i]", dtype=dtype)
-        # Record: this CSE var reads from `local_name`
         self._var_bufs[cse_var.name] = local_name
         self._var_dtypes[cse_var.name] = dtype
         return cse_var
@@ -687,15 +705,20 @@ class TileLangKernel(SIMDKernel):
         local_name = f"_{var}_local"
         if name not in self._tl_outputs:
             self._tl_outputs[name] = (var, local_name, dtype)
-        # Check that every op in the compute graph supports this output dtype.
-        # This is the right place to check: all loads/overrides have already run,
-        # so _var_ops/_var_consts are fully populated. NotImplementedError here
-        # propagates through _body() and triggers inductor's Triton fallback.
+            self._tl_output_indices[name] = index
         self._check_op_graph_dtype(str(value), dtype)
-        # Record: local_name should be filled with the result of `value`
         self._output_vars[local_name] = (value, dtype)
-        # Keep scalar emit for debugging / non-NPU paths
         self.stores.writeline(f"{local_name}[_tl_i] = {value}")
+
+    def store_reduction(self, name: str, index: sympy.Expr, value: TileLangCSEVariable) -> None:
+        dtype = V.graph.get_dtype(name)
+        var = self.args.output(name)
+        local_name = f"_{var}_local"
+        if name not in self._tl_outputs:
+            self._tl_outputs[name] = (var, local_name, dtype)
+            self._tl_output_indices[name] = index
+        self._output_vars[local_name] = (value, dtype)
+        self._is_reduction_output[local_name] = True
 
     def reduction(
         self,
@@ -704,28 +727,153 @@ class TileLangKernel(SIMDKernel):
         reduction_type: ReductionType,
         value: TileLangCSEVariable,
     ) -> TileLangCSEVariable:
-        raise NotImplementedError(
-            "TileLang backend: reductions not yet implemented; "
-            "this node will fall back to Triton."
-        )
+        if not self.inside_reduction:
+            raise RuntimeError("reduction() called outside reduction context")
+        if not self.persistent_reduction:
+            raise NotImplementedError(
+                "TileLang backend: non-persistent reduction not yet implemented; "
+                "falling back to Triton."
+            )
+        result_var = self.cse.newvar(dtype=dtype)
+        rt = str(reduction_type).split(".")[-1].lower()  # e.g. "ReductionType.SUM" → "sum"
+        self._var_ops[result_var.name] = ("reduce", rt, str(value))
+        self.outside_loop_vars.add(result_var)
+        return result_var
+
+    # ------------------------------------------------------------------
+    # Index offset helpers
+    # ------------------------------------------------------------------
+
+    def _axis_syms(self):
+        """Return (x_syms, r_syms) as dicts {sympy_symbol: IterationRangesEntry}."""
+        x_syms: dict = {}
+        r_syms: dict = {}
+        for sym, node in self.range_tree_nodes.items():
+            if node.name[0] == "r":
+                r_syms[sym] = node
+            else:
+                x_syms[sym] = node
+        return x_syms, r_syms
+
+    def _build_copy_offset(
+        self,
+        index: sympy.Expr,
+        x_syms: dict,
+        r_syms: dict,
+        grid_vars: dict,       # sym → sympy.Symbol  (the replacement grid variable)
+        r_start: sympy.Expr,   # replacement for all r-syms (0 for persistent)
+    ) -> str:
+        """Substitute axis symbols in *index* with grid/block variables and stringify."""
+        subs: dict = {r: r_start for r in r_syms}
+        subs.update(grid_vars)
+        result = index.subs(subs)
+        return self.index_to_str(result)
 
     # ------------------------------------------------------------------
     # Source generation
     # ------------------------------------------------------------------
 
     def codegen_kernel(self, name: Optional[str] = None) -> str:
+        if self.inside_reduction:
+            return self._codegen_reduction_kernel(name)
+        return self._codegen_pointwise_kernel(name)
+
+    def _prim_sig_parts(self, argdefs, signature):
+        parts = []
+        for argdef, sig in zip(argdefs, signature):
+            if isinstance(sig, TensorArg):
+                parts.append(
+                    f"{argdef.name}: T.Tensor((_xnumel,), '{tilelang_dtype(sig.dtype)}')"
+                )
+        return parts
+
+    def _emit_vec_ops_block(self, code, out_loc, result_var, dtype, already_allocated, block_size_str):
+        """Traverse op graph and emit T.v* calls into *code*."""
+        ops_list: list[tuple] = []
+        _build_vec_ops(
+            result_var, out_loc, ops_list,
+            self._var_bufs, self._var_ops, self._var_consts,
+        )
+        if not ops_list:
+            src = self._var_bufs.get(str(result_var), str(result_var))
+            if src != out_loc:
+                code.writeline(f"T.copy({src}, {out_loc})")
+            return
+        last_op, last_operands, _ = ops_list[-1]
+        ops_list[-1] = (last_op, last_operands, out_loc)
+        for op_name, operands, out_buf in ops_list:
+            if out_buf not in already_allocated:
+                code.writeline(
+                    f"{out_buf} = T.alloc_shared(({block_size_str},), '{tilelang_dtype(dtype)}')"
+                )
+                already_allocated.add(out_buf)
+            code.writeline(self._emit_vec_op(op_name, operands, out_buf))
+
+    def _codegen_pointwise_kernel(self, name: Optional[str] = None) -> str:
+        """
+        Emit a TileLang pointwise kernel.
+
+        Grid layout derived from axis metadata set by decide_codegen_dims_in_kernel:
+          - split_axis[i]  → outer grid dim i  (each AI Core owns one "row")
+          - tiling_axis[-1] (no_loop) → inner blocked dim, size _XBLOCK
+
+        Flat 1-D fallback is used when axis metadata is unavailable (e.g. very
+        first 1-D kernel before the NPUTritonScheduling path is activated).
+        """
         xblock       = _DEFAULT_XBLOCK
         prim_fn_name = f"{name or str(Placeholder.KERNEL_NAME)}_prim_fn"
 
         argdefs, _, signature, _ = self.args.python_argdefs()
+        prim_sig_parts = self._prim_sig_parts(argdefs, signature)
 
-        prim_sig_parts: list[str] = []
-        for argdef, sig in zip(argdefs, signature):
-            if isinstance(sig, TensoprArg):
-                prim_sig_parts.append(
-                    f"{argdef.name}: T.Tensor((_xnumel,), '{tilelang_dtype(sig.dtype)}')"
-                )
+        # ---- axis metadata (populated by decide_codegen_dims_in_kernel) ----
+        split_axes   = getattr(self, "split_axis", [])
+        tiling_axes  = getattr(self, "tiling_axis", [])
 
+        # Innermost no-loop tiling axis → the vectorised XBLOCK dimension.
+        inner_axis = next((ax for ax in reversed(tiling_axes) if ax.is_no_loop_axis), None)
+        outer_loop_axes = [ax for ax in tiling_axes if not ax.is_no_loop_axis]
+
+        # Build grid and the symbol→replacement mapping used for T.copy offsets.
+        x_syms, r_syms = self._axis_syms()
+
+        if split_axes and inner_axis and inner_axis is not split_axes[0]:
+            # 2-D (or higher) layout:  split dims → row grid,  inner → col grid
+            grid_var_syms: list[str] = []
+            grid_parts:   list[str] = []
+            sym_to_grid:  dict = {}
+
+            for i, ax in enumerate(split_axes):
+                gv = f"_gs{i}"
+                grid_var_syms.append(gv)
+                grid_parts.append(str(ax.length))          # one core per element
+                sym_to_grid[ax.symbol()] = sympy.Symbol(gv)
+
+            # Inner (no-loop) tiling axis → blocked grid dim
+            inner_gv = "_gi"
+            grid_var_syms.append(inner_gv)
+            grid_parts.append(f"T.ceildiv({inner_axis.length}, _XBLOCK)")
+            sym_to_grid[inner_axis.symbol()] = sympy.Symbol(inner_gv) * xblock
+
+            grid_str = ", ".join(grid_parts)
+            grid_vars_str = ", ".join(grid_var_syms)
+
+            def copy_offset(name_):
+                idx = self._tl_input_indices.get(name_) or self._tl_output_indices.get(name_)
+                if idx is None:
+                    # fallback: last split axis * inner_length + inner * xblock
+                    return f"_gs0 * {inner_axis.length} + _gi * _XBLOCK"
+                return self._build_copy_offset(idx, x_syms, r_syms, sym_to_grid, sympy.Integer(0))
+
+        else:
+            # 1-D layout (or single split-tiling axis): simple cid * _XBLOCK
+            grid_str = "T.ceildiv(_xnumel, _XBLOCK)"
+            grid_vars_str = "cid, _"
+
+            def copy_offset(_name):  # type: ignore[misc]
+                return "cid * _XBLOCK"
+
+        # ---- assemble prim_func ----
         code = IndentedBuffer()
         code.writeline("import tilelang.language as T")
         code.writeline("import math as _math")
@@ -740,73 +888,153 @@ class TileLangKernel(SIMDKernel):
         code.writeline("):")
 
         with code.indent():
-            code.writeline(
-                "with T.Kernel(T.ceildiv(_xnumel, _XBLOCK), is_npu=True) as (cid, _):"
-            )
+            code.writeline(f"with T.Kernel({grid_str}, is_npu=True) as ({grid_vars_str}):")
             with code.indent():
-                # ---- allocate input buffers (L1/shared) ----
-                for _, (var, loc, dtype) in self._tl_inputs.items():
-                    code.writeline(
-                        f"{loc} = T.alloc_shared((_XBLOCK,), '{tilelang_dtype(dtype)}')"
-                    )
+                # allocate input buffers
+                for nm, (var, loc, dtype) in self._tl_inputs.items():
+                    code.writeline(f"{loc} = T.alloc_shared((_XBLOCK,), '{tilelang_dtype(dtype)}')")
 
-                # ---- allocate output buffers (fragment) ----
+                # allocate output buffers not already allocated as inputs
                 input_locs = {loc for _, loc, _ in self._tl_inputs.values()}
-                for _, (var, loc, dtype) in self._tl_outputs.items():
+                for nm, (var, loc, dtype) in self._tl_outputs.items():
                     if loc not in input_locs:
-                        code.writeline(
-                            f"{loc} = T.alloc_shared((_XBLOCK,), '{tilelang_dtype(dtype)}')"
-                        )
+                        code.writeline(f"{loc} = T.alloc_shared((_XBLOCK,), '{tilelang_dtype(dtype)}')")
                 code.writeline("")
 
-                # ---- T.copy: GM → L1 for every input ----
-                for _, (var, loc, _) in self._tl_inputs.items():
-                    code.writeline(f"T.copy({var}[cid * _XBLOCK], {loc})")
+                # GM → L1
+                for nm, (var, loc, _) in self._tl_inputs.items():
+                    off = copy_offset(nm)
+                    code.writeline(f"T.copy({var}[{off}], {loc})")
                 code.writeline("")
 
-                # ---- emit NPU vector ops ----
-                already_allocated = (
+                # vector ops
+                already_allocated: set = (
                     {loc for _, loc, _ in self._tl_inputs.values()}
                     | {loc for _, loc, _ in self._tl_outputs.values()}
                 )
                 for out_loc, (result_var, dtype) in self._output_vars.items():
-                    ops_list: list[tuple] = []
-                    _build_vec_ops(
-                        result_var, out_loc, ops_list,
-                        self._var_bufs, self._var_ops, self._var_consts,
-                    )
-
-                    if not ops_list:
-                        # result_var is a direct input buffer reference (identity)
-                        src = self._var_bufs.get(str(result_var), str(result_var))
-                        if src != out_loc:
-                            code.writeline(f"T.copy({src}, {out_loc})")
-                        continue
-
-                    # Fix the last op to write directly into out_loc
-                    last_op, last_operands, _ = ops_list[-1]
-                    ops_list[-1] = (last_op, last_operands, out_loc)
-
-                    for op_name, operands, out_buf in ops_list:
-                        # Allocate intermediate fragment buffers on first use
-                        if out_buf not in already_allocated:
-                            code.writeline(
-                                f"{out_buf} = T.alloc_shared((_XBLOCK,), "
-                                f"'{tilelang_dtype(dtype)}')"
-                            )
-                            already_allocated.add(out_buf)
-
-                        op_str = self._emit_vec_op(op_name, operands, out_buf)
-                        code.writeline(op_str)
+                    self._emit_vec_ops_block(code, out_loc, result_var, dtype, already_allocated, "_XBLOCK")
 
                 code.writeline("")
 
-                # ---- T.copy: fragment → GM for every output ----
-                for _, (var, loc, _) in self._tl_outputs.items():
-                    code.writeline(f"T.copy({loc}, {var}[cid * _XBLOCK])")
+                # L1 → GM
+                for nm, (var, loc, _) in self._tl_outputs.items():
+                    off = copy_offset(nm)
+                    code.writeline(f"T.copy({loc}, {var}[{off}])")
 
         src = code.getvalue()
-        print("====== TileLang prim_func ======")
+        print("====== TileLang pointwise prim_func ======")
+        print(src)
+        return src
+
+    def _codegen_reduction_kernel(self, name: Optional[str] = None) -> str:
+        """
+        Emit a TileLang persistent-reduction kernel.
+
+        Layout:
+          Grid  = xnumel  (one AI Core per output element)
+          Input = T.copy(in_ptr[cid * _rnumel], _in_local)  size=rnumel
+          Reduce= T.reduce_{op}(_in_local, _out_local, dim=0)
+          Output= T.copy(_out_local, out_ptr[cid])
+
+        Non-persistent reduction raises NotImplementedError (→ Triton fallback).
+        """
+        if not self.persistent_reduction:
+            raise NotImplementedError(
+                "TileLang backend: non-persistent reduction not implemented; "
+                "falling back to Triton."
+            )
+
+        prim_fn_name = f"{name or str(Placeholder.KERNEL_NAME)}_prim_fn"
+        argdefs, _, signature, _ = self.args.python_argdefs()
+        prim_sig_parts = self._prim_sig_parts(argdefs, signature)
+
+        x_syms, r_syms = self._axis_syms()
+        _cid  = sympy.Symbol("cid")
+        _zero = sympy.Integer(0)
+
+        # Determine r_numel as a code string
+        r_nodes = list(r_syms.values())
+        if r_nodes:
+            simplified = V.graph.sizevars.simplify(r_nodes[0].length)
+            r_numel_str = str(int(simplified)) if isinstance(simplified, (sympy.Integer, int)) else "_rnumel"
+        else:
+            r_numel_str = "1"
+
+        # Substitution maps for input/output offset computation
+        x_to_grid = {s: _cid for s in x_syms}
+        r_to_zero = {s: _zero for s in r_syms}
+
+        def in_offset(nm):
+            idx = self._tl_input_indices.get(nm)
+            if idx is None:
+                return f"cid * {r_numel_str}"
+            return self._build_copy_offset(idx, x_syms, r_syms, {**x_to_grid, **r_to_zero}, _zero)
+
+        def out_offset(nm):
+            idx = self._tl_output_indices.get(nm)
+            if idx is None:
+                return "cid"
+            return self._build_copy_offset(idx, x_syms, r_syms, {**x_to_grid, **r_to_zero}, _zero)
+
+        # ---- assemble prim_func ----
+        code = IndentedBuffer()
+        code.writeline("import tilelang.language as T")
+        code.writeline("import math as _math")
+        code.writeline("")
+        code.writeline("@T.prim_func")
+        code.writeline(f"def {prim_fn_name}(")
+        with code.indent():
+            for i, part in enumerate(prim_sig_parts):
+                code.writeline(f"{part}{',' if i < len(prim_sig_parts) - 1 else ''}")
+        code.writeline("):")
+
+        with code.indent():
+            code.writeline("with T.Kernel(_xnumel, is_npu=True) as (cid, _):")
+            with code.indent():
+                # allocate input (full r-dim per core)
+                for nm, (var, loc, dtype) in self._tl_inputs.items():
+                    code.writeline(f"{loc} = T.alloc_shared(({r_numel_str},), '{tilelang_dtype(dtype)}')")
+
+                # allocate output (scalar per core)
+                input_locs = {loc for _, loc, _ in self._tl_inputs.values()}
+                for nm, (var, loc, dtype) in self._tl_outputs.items():
+                    if loc not in input_locs:
+                        code.writeline(f"{loc} = T.alloc_shared((1,), '{tilelang_dtype(dtype)}')")
+                code.writeline("")
+
+                # GM → L1: load full reduction slice
+                for nm, (var, loc, _) in self._tl_inputs.items():
+                    off = in_offset(nm)
+                    code.writeline(f"T.copy({var}[{off}], {loc})")
+                code.writeline("")
+
+                # Reduction ops
+                already_allocated: set = (
+                    {loc for _, loc, _ in self._tl_inputs.values()}
+                    | {loc for _, loc, _ in self._tl_outputs.values()}
+                )
+                for out_loc, (result_var, dtype) in self._output_vars.items():
+                    is_red = self._is_reduction_output.get(out_loc, False)
+                    if is_red and result_var.name in self._var_ops:
+                        op_entry = self._var_ops[result_var.name]
+                        if op_entry[0] == "reduce":
+                            _, rt, in_var_str = op_entry
+                            src_buf = self._var_bufs.get(in_var_str, f"_{in_var_str}_local")
+                            tl_fn = _REDUCE_OPS.get(rt, "reduce_sum")
+                            code.writeline(f"T.{tl_fn}({src_buf}, {out_loc}, dim=0)")
+                    else:
+                        # pointwise epilogue fused with reduction output
+                        self._emit_vec_ops_block(code, out_loc, result_var, dtype, already_allocated, "1")
+                code.writeline("")
+
+                # L1 → GM: store scalar result
+                for nm, (var, loc, _) in self._tl_outputs.items():
+                    off = out_offset(nm)
+                    code.writeline(f"T.copy({loc}, {var}[{off}])")
+
+        src = code.getvalue()
+        print("====== TileLang reduction prim_func ======")
         print(src)
         return src
 
@@ -906,38 +1134,24 @@ class TileLangKernel(SIMDKernel):
             self._pending_op = None
         return var
 
-    def should_use_persistent_reduction(self) -> bool:
-        return False
-
-    def should_use_cooperative_reduction(self) -> bool:
-        return False
-
-
 # ---------------------------------------------------------------------------
 # Scheduling
 # ---------------------------------------------------------------------------
 
-class TileLangScheduling(SIMDScheduling):
+class TileLangScheduling(NPUTritonScheduling):
     """
     Inductor scheduling backend that emits TileLang kernels for Ascend NPU.
 
-    Registered via ``register_backend_for_device`` in __init__.py when
-    ``TORCHINDUCTOR_NPU_BACKEND=tilelang``.
+    Inherits NPUTritonScheduling so that the full decide_codegen_dims_in_kernel
+    pipeline (SplitTiling / ReductionAnalysis) runs before codegen, populating
+    axis metadata on TileLangKernel.  Only define_kernel and codegen_sync are
+    overridden; everything else (codegen_node_schedule, codegen_comment, …) is
+    inherited from NPUTritonScheduling / TritonScheduling / SIMDScheduling.
+
+    Activated via ``TORCHINDUCTOR_NPU_BACKEND=tilelang``.
     """
 
     kernel_type: type[Any] = TileLangKernel
-
-    backend_features: OrderedSet[BackendFeature] = OrderedSet()
-
-    @classmethod
-    def get_backend_features(cls, device: torch.device) -> OrderedSet[BackendFeature]:
-        return cls.backend_features
-
-    def codegen_comment(self, node_schedule) -> None:
-        wrapper = V.graph.wrapper_code
-        origins, _ = get_kernel_metadata(node_schedule, wrapper)
-        if origins:
-            wrapper.writeline(origins)
 
     def codegen_sync(self) -> None:
         V.graph.wrapper_code.writeline("torch.npu.synchronize()")
@@ -947,7 +1161,8 @@ class TileLangScheduling(SIMDScheduling):
         src_code: str,
         node_schedule,
         kernel: TileLangKernel,
-    ) -> str:
+        traced_graph_hash: Optional[str] = None,
+    ) -> tuple[str, str]:
         """
         Splice a shape-keyed caching wrapper into ``wrapper.header``.
 
@@ -969,9 +1184,11 @@ class TileLangScheduling(SIMDScheduling):
                 _<name>_cache[_key](in_ptr0, ...)
         """
         wrapper = V.graph.wrapper_code
+        cache_key = (src_code, traced_graph_hash)
 
-        if src_code in wrapper.src_to_kernel:
-            return wrapper.src_to_kernel[src_code]
+        if cache_key in wrapper.src_to_kernel:
+            kernel_name = wrapper.src_to_kernel[cache_key]
+            return kernel_name, src_code
 
         fused_name = (
             get_fused_kernel_name(node_schedule, config.triton.descriptive_names)
@@ -979,7 +1196,7 @@ class TileLangScheduling(SIMDScheduling):
         )
         suffix      = wrapper.next_kernel_suffix()
         kernel_name = "_".join(filter(None, ["tilelang", fused_name, suffix]))
-        wrapper.src_to_kernel[src_code] = kernel_name
+        wrapper.src_to_kernel[cache_key] = kernel_name
 
         src_code = src_code.replace(str(Placeholder.KERNEL_NAME), kernel_name)
 
@@ -1021,7 +1238,14 @@ class TileLangScheduling(SIMDScheduling):
         )
         code.writeline(f"def {factory_fn}({factory_params}):")
         with code.indent():
-            code.writeline(f"_xnumel = {numel_arg_names[0]}" if numel_arg_names else "_xnumel = 1")
+            # Expose every numel as _<prefix>numel inside the factory closure
+            # so the prim_func body can reference _xnumel, _rnumel, etc.
+            if numel_arg_names:
+                for n in numel_arg_names:
+                    prefix = n[0]   # "xnumel" → "x",  "rnumel" → "r"
+                    code.writeline(f"_{prefix}numel = {n}")
+            else:
+                code.writeline("_xnumel = 1")
             code.splice(src_code)
             code.writeline(f"return {prim_fn_name}")
 
@@ -1050,4 +1274,4 @@ class TileLangScheduling(SIMDScheduling):
             code.writeline(f"{cache_var}[_key]({', '.join(tensor_call_args)})")
 
         wrapper.header.splice(code.getvalue())
-        return kernel_name
+        return kernel_name, src_code
