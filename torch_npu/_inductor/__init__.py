@@ -46,7 +46,7 @@ elif os.getenv('TORCHINDUCTOR_NPU_BACKEND', 'default') == 'tilelang':
 
     patch_cache_base_get_system()
     patch_is_gpu()
-    patch_has_triton() # inductor 内部用 has_triton() 来决定是否走 SIMD 调度路径
+    patch_has_triton()  # inductor uses has_triton() to select SIMD scheduling
     disable_foreach()
 else:
     import os

@@ -177,6 +177,7 @@ def patch_inductor_wrapper():
 
     def new_get_config_copy(self) -> Dict[str, Any]:
         ori_dict = src_get_config_copy(self)
+        # Local tilelang backend config experiment is disabled for testing.
         NpuBackendType = Literal["default", "mlir", "dvm"]
         if "npu_backend" not in ori_dict:
             ori_dict["npu_backend"] = "default"
@@ -222,6 +223,8 @@ def patch_inductor_wrapper():
             os.environ['TORCHINDUCTOR_NPU_BACKEND'] = 'dvm'
             from torch_npu._inductor.ascend_npu_ir.ascend_npu_ir.npu import npu_inductor_plugin
             from torch_npu._inductor.dvm import mlir_fusion
+        # elif self.config.get("npu_backend") == "tilelang" or torch._inductor.config.npu_backend == "tilelang":
+        #     os.environ['TORCHINDUCTOR_NPU_BACKEND'] = 'tilelang'
 
     _TorchCompileInductorWrapper.__call__ = new_call
     _TorchCompileInductorWrapper.apply_options = new_apply_options

@@ -18,7 +18,7 @@ Generated kernel structure:
         with T.Kernel(T.ceildiv(_xnumel, _XBLOCK), is_npu=True) as (cid, _):
             _in_ptr0_local  = T.alloc_shared((_XBLOCK,), 'float32')  # L1/UB
             _out_ptr0_local = T.alloc_shared((_XBLOCK,), 'float32') # fragment
-            T.copy(in_ptr0[cid * _XBLOCK], _in_ptr0_local)  # GM -> L1
+            T.copy(in_ptr0[cid * _XBLOCK], _in_ptr0_local)  # GM -> L1/UB
             T.vadd(_in_ptr0_local, _in_ptr1_local, _out_ptr0_local)  # vector op
             T.copy(_out_ptr0_local, out_ptr0[cid * _XBLOCK])  # fragment -> GM
 
@@ -52,6 +52,7 @@ import torch
 from torch.utils._ordered_set import OrderedSet
 
 from torch._inductor import config, ir
+from torch._inductor import scheduler as inductor_scheduler
 from torch._inductor.codegen.common import (
     BackendFeature,
     CSE,
@@ -65,13 +66,16 @@ from torch._inductor.codegen.simd import (
     SIMDScheduling,
     IterationRangesRoot,
     IterationRangesEntry,
+    schedule_log,
 )
 from torch._inductor.codegen.triton import (
     get_fused_kernel_name,
     get_kernel_metadata,
 )
-from torch._inductor.utils import Placeholder
+from torch._inductor.utils import Placeholder, sympy_product
 from torch._inductor.virtualized import ReductionType, StoreMode, V
+
+from .scheduling import NPUTritonScheduling
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +157,7 @@ _ANY_SUPPORTED_DTYPE: frozenset[torch.dtype] = frozenset().union(
 
 
 # ---------------------------------------------------------------------------
-# Expression → op parser
+# Expression -> op parser
 # ---------------------------------------------------------------------------
 
 def _parse_expr_op(expr: str) -> Optional[tuple[str, list[str]]]:
@@ -606,7 +610,7 @@ class TileLangKernel(SIMDKernel):
     Generates a TileLang @T.prim_func body for a fused set of pointwise nodes.
 
     Uses NPU vector intrinsics (T.vadd, T.vexp, ...) instead of T.Parallel
-    scalar loops — scalar element-wise stores to Ascend L1 (cbuf) are not
+    scalar loops - scalar element-wise stores to Ascend L1 (cbuf) are not
     supported by the BiShengHIR pipeline.
     """
 
@@ -623,11 +627,11 @@ class TileLangKernel(SIMDKernel):
 
         # Op graph (built during load/store/overrides calls)
         self._pending_op: Optional[tuple] = None
-        self._var_ops:    dict[str, tuple] = {}   # var_name → (op, operands)
-        self._var_bufs:   dict[str, str] = {}     # var_name → local_buf_name
-        self._var_consts: dict[str, str] = {}     # var_name → literal string (e.g. "2.0")
+        self._var_ops:    dict[str, tuple] = {}   # CSE var name -> (op, operands)
+        self._var_bufs:   dict[str, str] = {}     # CSE var name -> local buffer name
+        self._var_consts: dict[str, str] = {}     # CSE var name -> literal string
         self._var_dtypes: dict[str, torch.dtype] = {}
-        self._output_vars: dict[str, tuple] = {}  # local_buf_name → (var, dtype)
+        self._output_vars: dict[str, tuple] = {}  # output local buffer -> (CSE var, dtype)
 
     # ------------------------------------------------------------------
     # SIMDKernel abstract interface
@@ -721,7 +725,7 @@ class TileLangKernel(SIMDKernel):
 
         prim_sig_parts: list[str] = []
         for argdef, sig in zip(argdefs, signature):
-            if isinstance(sig, TensoprArg):
+            if isinstance(sig, TensorArg):
                 prim_sig_parts.append(
                     f"{argdef.name}: T.Tensor((_xnumel,), '{tilelang_dtype(sig.dtype)}')"
                 )
@@ -759,7 +763,7 @@ class TileLangKernel(SIMDKernel):
                         )
                 code.writeline("")
 
-                # ---- T.copy: GM → L1 for every input ----
+                # ---- T.copy: GM -> L1 for every input ----
                 for _, (var, loc, _) in self._tl_inputs.items():
                     code.writeline(f"T.copy({var}[cid * _XBLOCK], {loc})")
                 code.writeline("")
@@ -801,7 +805,7 @@ class TileLangKernel(SIMDKernel):
 
                 code.writeline("")
 
-                # ---- T.copy: fragment → GM for every output ----
+                # ---- T.copy: fragment -> GM for every output ----
                 for _, (var, loc, _) in self._tl_outputs.items():
                     code.writeline(f"T.copy({loc}, {var}[cid * _XBLOCK])")
 
@@ -900,7 +904,7 @@ class TileLangKernel(SIMDKernel):
         if self._pending_op is not None:
             op_name, operands = self._pending_op[0], self._pending_op[1]
             if op_name == "const":
-                self._var_consts[name] = operands[0]  # e.g. "tmp1" → "2.0"
+                self._var_consts[name] = operands[0]  # e.g. "tmp1" -> "2.0"
             else:
                 self._var_ops[name] = (op_name, operands)
             self._pending_op = None
@@ -917,7 +921,7 @@ class TileLangKernel(SIMDKernel):
 # Scheduling
 # ---------------------------------------------------------------------------
 
-class TileLangScheduling(SIMDScheduling):
+class TileLangScheduling(NPUTritonScheduling):
     """
     Inductor scheduling backend that emits TileLang kernels for Ascend NPU.
 
@@ -928,6 +932,11 @@ class TileLangScheduling(SIMDScheduling):
     kernel_type: type[Any] = TileLangKernel
 
     backend_features: OrderedSet[BackendFeature] = OrderedSet()
+
+    def __init__(self, input_scheduler) -> None:
+        super().__init__(input_scheduler)
+        self.kernel_type = TileLangKernel
+        self._triton_scheduling = NPUTritonScheduling(input_scheduler)
 
     @classmethod
     def get_backend_features(cls, device: torch.device) -> OrderedSet[BackendFeature]:
@@ -942,11 +951,70 @@ class TileLangScheduling(SIMDScheduling):
     def codegen_sync(self) -> None:
         V.graph.wrapper_code.writeline("torch.npu.synchronize()")
 
+    def _fallback_to_triton(self, node, reason: str):
+        schedule_log.debug("TileLang fallback to NPU Triton: %s", reason)
+        return self._triton_scheduling.codegen_node(node)
+
+    def _unsupported_tilelang_reason(
+        self,
+        nodes: list[inductor_scheduler.SchedulerNode],
+        reduction_numel: sympy.Expr,
+    ) -> Optional[str]:
+        if str(reduction_numel) != "1":
+            return f"reduction_numel={reduction_numel}"
+
+        for node in nodes:
+            if node.is_template():
+                return f"{node.get_name()} is a template node"
+            if node.is_reduction():
+                return f"{node.get_name()} is a reduction node"
+            if node.is_split_scan():
+                return f"{node.get_name()} is a split-scan node"
+
+        graph_inputs = set(getattr(V.graph, "graph_inputs", {}).keys())
+        produced = set()
+        used = set()
+        for node in nodes:
+            produced |= node.get_buffer_names()
+            used |= node.used_buffer_names()
+
+        for name in used - produced:
+            if name not in graph_inputs:
+                return f"{name} is an intermediate external input"
+
+        return None
+
+    def codegen_node(
+        self,
+        node: inductor_scheduler.FusedSchedulerNode | inductor_scheduler.SchedulerNode,
+    ):
+        nodes: list[inductor_scheduler.SchedulerNode] = node.get_nodes()  # type: ignore[assignment]
+        _, (_, rnumel) = max(nodes, key=lambda x: int(x.is_reduction())).group
+
+        reason = self._unsupported_tilelang_reason(nodes, rnumel)
+        if reason is not None:
+            return self._fallback_to_triton(node, reason)
+
+        try:
+            return SIMDScheduling.codegen_node(self, node)
+        except NotImplementedError as exc:
+            return self._fallback_to_triton(node, str(exc))
+
+    def codegen_node_schedule(self, kernel_features, nodes=None):
+        return SIMDScheduling.codegen_node_schedule(self, kernel_features)
+
+    @classmethod
+    def select_tiling(cls, nodes, numel, reduction_numel=1):
+        if isinstance(numel, (list, tuple)):
+            numel = sympy_product(numel)
+        return {"x": numel}
+
     def define_kernel(
         self,
         src_code: str,
         node_schedule,
         kernel: TileLangKernel,
+        traced_graph_hash: Optional[str] = None,
     ) -> str:
         """
         Splice a shape-keyed caching wrapper into ``wrapper.header``.
@@ -1006,7 +1074,7 @@ class TileLangScheduling(SIMDScheduling):
         prim_fn_name = f"{kernel_name}_prim_fn"
 
         code = IndentedBuffer()
-        code.writeline(f"\n# TileLang kernel — {meta_comment}")
+        code.writeline(f"\n# TileLang kernel - {meta_comment}")
         if tl_pkg_root:
             code.writeline("import sys as _sys")
             code.writeline(
