@@ -198,7 +198,7 @@ _check("mul_mul int32  x*y*2",
 
 
 # ===========================================================================
-# 2-D tensors — TileLang treats as flat contiguous
+# 2-D tensors
 # ===========================================================================
 print("\n========== 2-D tensors ==========")
 
@@ -211,6 +211,56 @@ _check("sigmoid 2D fp32",   lambda x: torch.sigmoid(x),     x2)
 _check("silu 2D fp32",      lambda x: x * torch.sigmoid(x), x2)
 _check("add 2D fp16",       lambda x, y: x + y,             x2h, x2h)
 _check("relu 2D fp16",      lambda x: torch.relu(x),        x2h)
+
+
+# ===========================================================================
+# 3-D tensors — e.g. (batch, seq, hidden)
+# TileLang flattens all dims into one contiguous xnumel; the kernel shape is
+# the same as 1-D/2-D — only the total element count matters.
+# ===========================================================================
+print("\n========== 3-D tensors ==========")
+
+x3  = torch.randn(4, 32, 128, device=DEVICE, dtype=torch.float32)
+y3  = torch.randn(4, 32, 128, device=DEVICE, dtype=torch.float32)
+xp3 = torch.rand(4, 32, 128,  device=DEVICE, dtype=torch.float32) + 0.1
+x3h = torch.randn(4, 32, 128, device=DEVICE, dtype=torch.float16)
+
+_check("add 3D fp32",           lambda x, y: x + y,                   x3,  y3)
+_check("sub 3D fp32",           lambda x, y: x - y,                   x3,  y3)
+_check("mul 3D fp32",           lambda x, y: x * y,                   x3,  y3)
+_check("relu 3D fp32",          lambda x: torch.relu(x),              x3)
+_check("sigmoid 3D fp32",       lambda x: torch.sigmoid(x),           x3)
+_check("tanh 3D fp32",          lambda x: torch.tanh(x),              x3)
+_check("exp 3D fp32",           lambda x: torch.exp(x),               x3)
+_check("sqrt 3D fp32",          lambda x: torch.sqrt(x),              xp3)
+_check("silu 3D fp32",          lambda x: x * torch.sigmoid(x),       x3)
+_check("add 3D fp16",           lambda x, y: x + y,                   x3h, x3h)
+_check("relu 3D fp16",          lambda x: torch.relu(x),              x3h)
+_check("scale_bias 3D fp32",    lambda x, y, z: x * y + z,            x3, y3, xp3)
+
+
+# ===========================================================================
+# 4-D tensors — e.g. (batch, heads, seq, head_dim)
+# ===========================================================================
+print("\n========== 4-D tensors ==========")
+
+x4  = torch.randn(2, 4, 32, 64, device=DEVICE, dtype=torch.float32)
+y4  = torch.randn(2, 4, 32, 64, device=DEVICE, dtype=torch.float32)
+xp4 = torch.rand(2, 4, 32, 64,  device=DEVICE, dtype=torch.float32) + 0.1
+x4h = torch.randn(2, 4, 32, 64, device=DEVICE, dtype=torch.float16)
+
+_check("add 4D fp32",           lambda x, y: x + y,                   x4,  y4)
+_check("mul 4D fp32",           lambda x, y: x * y,                   x4,  y4)
+_check("relu 4D fp32",          lambda x: torch.relu(x),              x4)
+_check("sigmoid 4D fp32",       lambda x: torch.sigmoid(x),           x4)
+_check("tanh 4D fp32",          lambda x: torch.tanh(x),              x4)
+_check("exp 4D fp32",           lambda x: torch.exp(x),               x4)
+_check("sqrt 4D fp32",          lambda x: torch.sqrt(x),              xp4)
+_check("silu 4D fp32",          lambda x: x * torch.sigmoid(x),       x4)
+_check("neg_exp 4D fp32",       lambda x: torch.exp(-x),              x4)
+_check("add 4D fp16",           lambda x, y: x + y,                   x4h, x4h)
+_check("sigmoid 4D fp16",       lambda x: torch.sigmoid(x),           x4h)
+_check("scale_bias 4D fp32",    lambda x, y, z: x * y + z,            x4, y4, xp4)
 
 
 # ===========================================================================

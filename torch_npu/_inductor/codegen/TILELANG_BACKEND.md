@@ -91,9 +91,9 @@ NPUTritonScheduling.codegen_node_schedule()          ← 继承自 NPUTritonSche
   │    ├─ [pointwise]  _codegen_pointwise_kernel()
   │    │   ├─ 读 split_axis / tiling_axis → 确定 grid 和 T.copy offset
   │    │   ├─ T.alloc_shared(XBLOCK) × 每个输入输出
-  │    │   ├─ T.copy(gm[offset], local)           GM → L1
+  │    │   ├─ T.copy(gm[offset], local)
   │    │   ├─ T.vadd/vsub/vexp/...               向量 intrinsic
-  │    │   └─ T.copy(local, gm[offset])           L1 → GM
+  │    │   └─ T.copy(local, gm[offset])
   │    │
   │    └─ [reduction]  _codegen_reduction_kernel()
   │        ├─ T.Tensor((_xnumel, _rnumel)) 2D 张量签名
@@ -242,18 +242,20 @@ def kernel_prim_fn(
     out_ptr0: T.Tensor((_xnumel, 1),       'float32'),  # 2-D: M × 1
 ):
     with T.Kernel(T.ceildiv(_xnumel, _ROW_BLOCK), is_npu=True) as (cid, _):
-        _in_ptr0_local  = T.alloc_shared((_ROW_BLOCK, _rnumel), 'float32')  # cbuf
-        _out_ptr0_local = T.alloc_shared((_ROW_BLOCK, 1),       'float32')  # cbuf
+        _in_ptr0_local  = T.alloc_shared((_ROW_BLOCK, _rnumel), 'float32')
+        _out_ptr0_local = T.alloc_shared((_ROW_BLOCK, 1),       'float32')
 
         T.copy(in_ptr0[cid * _ROW_BLOCK, 0], _in_ptr0_local,
-               size=[_ROW_BLOCK, _rnumel])               # GM → cbuf: nd2nz
+               size=[_ROW_BLOCK, _rnumel])
 
         T.reduce(_in_ptr0_local, _out_ptr0_local,
-                 dims=1, reduce_mode='sum', clear=True)   # 批量规约（32 行）
+                 dims=1, reduce_mode='sum', clear=True)
 
         T.copy(_out_ptr0_local, out_ptr0[cid * _ROW_BLOCK, 0],
-               size=[_ROW_BLOCK, 1])                      # cbuf → GM: 128B DMA
+               size=[_ROW_BLOCK, 1])
 ```
+
+> `T.copy` 的具体硬件指令由 TileLang 编译器在 NPUIR 降级时自动选择（`gm→cbuf` 降为 `hivm.hir.nd2nz`，`cbuf→gm` 降为 `hivm.hir.store: ub→gm`），不出现在 TileLang 源码层。
 
 ### dtype 提升
 
@@ -308,6 +310,98 @@ Inductor 对所有 reduction 调用 `upcast_acc_dtype()` 将 fp16 → fp32 accum
 
 ---
 
+## NPU Triton Pipeline
+
+NPU Triton 后端（`triton.py` + `scheduling.py`）的完整流程，作为对比基准：
+
+```
+NPUTritonScheduling.codegen_node_schedule()
+  │
+  ├─①  select_tiling()                          ← 同 TileLang：完全相同
+  │
+  ├─②  NPUIndexTritonKernel.__init__(tiling)    ← 初始化 range tree / axis 字段
+  │
+  ├─③  decide_codegen_dims_in_kernel()          ← 同 TileLang：完全相同
+  │       SplitTiling / ReductionAnalysis / no_loop_axis
+  │
+  ├─④  codegen_node_schedule_with_kernel()      ← 同 TileLang：调用路径相同
+  │       对每个 node 调 node._body(*index_vars)：
+  │       ├─ NPUIndexTritonKernel.load()
+  │       │     ① IndexAnalysis 分析 index（BlockPtr / IndexingOptions）
+  │       │     ② emit: tl.load(ptr + offset, mask)  → self.loads buffer
+  │       ├─ NPUIndexTritonKernel.store()
+  │       │     ① 分析 index
+  │       │     ② emit: tl.store(ptr + offset, val, mask) → self.stores buffer
+  │       ├─ NPUIndexTritonKernel.reduction()
+  │       │     persistent: emit tl.sum/max(val, dim) → self.compute buffer
+  │       │     loop:       emit accumulator 更新    → self.compute buffer
+  │       │                 emit tl.sum(acc, dim)    → self.post_loop_store buffer
+  │       └─ NPUIndexTritonKernel.codegen_body()    ← ★ Triton 独有
+  │             生成嵌套循环写入 self.body：
+  │             for split_axis in range(offset, min(offset+XBLOCK, numel)):
+  │               for tiling_axis in range(loops_tiling):
+  │                 x = tl.arange(0, XBLOCK_SUB) + offset
+  │                 mask = x < numel
+  │                 splice(indexing_code)
+  │                 splice(loads)        # tl.load(...)
+  │                 splice(compute)      # tl.add / tl.sum / ...
+  │                 splice(stores)       # tl.store(...)
+  │               splice(post_loop_store) # tl.store(reduce_result, ...)
+  │
+  ├─⑤  NPUIndexTritonKernel.codegen_kernel()    ← ★ Triton 独有
+  │       ① gen_common_triton_imports()          (triton / triton.language / ...)
+  │       ② gen_numel_args() → x0_numel, X0BLOCK, X0BLOCK_SUB 等参数
+  │       ③ add_autotune_args()                 → constexpr tiling 参数
+  │       ④ @triton_heuristics.pointwise/reduction/persistent_reduction(
+  │              size_hints=..., triton_meta=..., inductor_meta=...)
+  │          @triton.jit
+  │          def kernel_fn(in_ptr0, out_ptr0, x0_numel,
+  │                        X0BLOCK: tl.constexpr, X0BLOCK_SUB: tl.constexpr):
+  │       ⑤ codegen_static_numels()             → persistent reduction 静态常量
+  │       ⑥ splice(self.body)                   → ④ 中 codegen_body() 已填好的循环代码
+  │
+  ├─⑥  NPUTritonScheduling.define_kernel()      ← ★ Triton 独有
+  │       kernel_name = "triton_poi/red_<fused>_<suffix>"
+  │       async_compile.triton(kernel_name, '''
+  │           import triton
+  │           import triton.language as tl
+  │           @triton_heuristics.pointwise(...)
+  │           @triton.jit
+  │           def kernel_fn(...): ...
+  │       ''', device_str='npu')
+  │       → wrapper.define_kernel(kernel_name, compile_wrapper)  → PyCodeCache
+  │
+  └─⑦  NPUIndexTritonKernel.call_kernel()       ← ★ Triton 独有
+          kernel_name.run(in_ptr0, out_ptr0, x0_numel,
+                          X0BLOCK=..., grid=grid_fn,
+                          stream=stream)
+```
+
+生成的 Triton kernel 示例（pointwise add，1D）：
+
+```python
+@triton_heuristics.pointwise(
+    size_hints=[1024],
+    triton_meta={'signature': {'in_ptr0': '*fp32', ...}, 'mix_mode': 'aiv'},
+    inductor_meta={'split_axis': [0], 'tiling_axis': [0], ...},
+)
+@triton.jit
+def triton_poi_fused_add_0(in_ptr0, in_ptr1, out_ptr0, x0_numel,
+                            X0BLOCK: tl.constexpr, X0BLOCK_SUB: tl.constexpr):
+    x0_offset = tl.program_id(0) * X0BLOCK
+    base_x0 = tl.arange(0, X0BLOCK_SUB)
+    loops_x0 = (X0BLOCK + X0BLOCK_SUB - 1) // X0BLOCK_SUB
+    for loop_x0 in range(loops_x0):
+        x0 = x0_offset + (loop_x0 * X0BLOCK_SUB) + base_x0
+        x0_mask = x0 < min(X0BLOCK + x0_offset, x0_numel)
+        tmp0 = tl.load(in_ptr0 + x0, x0_mask)
+        tmp1 = tl.load(in_ptr1 + x0, x0_mask)
+        tmp2 = tmp0 + tmp1
+        tl.store(out_ptr0 + x0, tmp2, x0_mask)
+```
+
+---
+
 ## TileLang vs Triton Pipeline 差异
 
 | 维度 | NPU Triton (triton.py) | TileLang (tilelang.py) |
@@ -322,6 +416,36 @@ Inductor 对所有 reduction 调用 `upcast_acc_dtype()` 将 fp16 → fp32 accum
 | **调用风格** | kernel.run(..., stream=stream) | kernel(tensors, xnumel, rnumel) |
 | **shape cache** | 无（静态 kernel） | (xnumel, rnumel,...) key 动态 compile |
 | **编译器链** | Triton → NPU IR → bishengir-compile | tilelang.compile → TVM → MLIR → bishengir-compile |
+
+### 完全共享的部分
+
+以下代码/逻辑在两个后端**完全相同**，TileLang 通过继承直接复用，无任何覆写：
+
+| 阶段 | 共享代码位置 | 说明 |
+|---|---|---|
+| **select_tiling** | `NPUTritonScheduling.select_tiling()` + `candidate_tilings()` | tile shape 选择，含 split/reduction numel 计算 |
+| **decide_codegen_dims_in_kernel** | `NPUTritonScheduling._mark_store_index_keys()` 等 5 个方法 | 轴分析全流程 |
+| **SplitTiling** | `split_tiling.py` 全部 | split/tiling/no_loop 轴选择 |
+| **ReductionAnalysis** | `kernel_analysis.py::ReductionAnalysis` | reduced_dim 计算 |
+| **split_and_set_ranges** | `NPUIndexTritonKernel.split_and_set_ranges()` | node var_ranges → range tree 映射 |
+| **transform_dims_in_indexing** | `ir.py::transform_dims_in_indexing()` | index 线性化、FloorDiv/Mod 拆分 |
+| **rebuild_flattened_dims** | `ir.py::rebuild_flattened_dims()` | flat+2D 混合访问的冗余轴替换 |
+| **codegen_node_schedule_with_kernel** | 上游 `TritonScheduling` | node 遍历、调用 load/store/reduction |
+| **codegen_node_schedule 主流程** | `NPUTritonScheduling.codegen_node_schedule()` | 7 步主循环（①~③⑤共用，④⑥⑦各自覆写）|
+| **call_kernel 签名** | `TileLangKernel.active_range_trees()` | numel 参数列表生成 |
+
+### 两边各自覆写的部分
+
+| 阶段 | NPU Triton | TileLang |
+|---|---|---|
+| `load()` | emit `tl.load` → `self.loads` | 记录 `_tl_inputs` / `_var_bufs` |
+| `store()` | emit `tl.store` → `self.stores` | 记录 `_output_vars` |
+| `reduction()` | emit `tl.sum/max` → `self.compute` | 记录 `_var_ops[var] = ("reduce",...)` |
+| `store_reduction()` | emit → `self.post_loop_store` | 记录 `_is_reduction_output` |
+| `codegen_body()` | 生成嵌套循环写入 `self.body` | NOP（CSE 失效 + buffer 清理） |
+| `codegen_kernel()` | 读 `self.body` 输出 `@triton.jit` | 从 op graph 重建 `@T.prim_func` |
+| `define_kernel()` | `async_compile.triton(...)` → PyCodeCache | factory fn + shape dict cache |
+| `call_kernel()` | `kernel_name.run(..., stream=stream)` | `kernel_name(tensors, xnumel, rnumel)` |
 
 ---
 
