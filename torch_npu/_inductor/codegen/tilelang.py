@@ -615,7 +615,7 @@ def _build_vec_ops(
 
 def _has_reduction_index(index: sympy.Expr) -> bool:
     return any(
-        getattr(symbol, "name", str(symbol)).startswith("r")
+        re.match(r"r\d+_", getattr(symbol, "name", str(symbol)))
         for symbol in index.free_symbols
     )
 
@@ -1163,7 +1163,7 @@ class TileLangKernel(SIMDKernel):
                     scalar_locs = set(self._reduction_outputs)
                     broadcasted_scalars: dict[str, str] = {}
 
-                    def vectorize_operand(operand):
+                    def _vectorize_for_reduction(operand):
                         if not isinstance(operand, str) or operand not in scalar_locs:
                             return operand
                         if operand not in broadcasted_scalars:
@@ -1204,7 +1204,7 @@ class TileLangKernel(SIMDKernel):
                                 f"'{tilelang_dtype(dtype)}')"
                             )
                             already_allocated.add(op_out_buf)
-                        operands = [vectorize_operand(operand) for operand in operands]
+                        operands = [_vectorize_for_reduction(operand) for operand in operands]
                         operands = self._materialize_scalar_operands(
                             code, op_name, operands, dtype, scalar_cache
                         )
@@ -1224,7 +1224,7 @@ class TileLangKernel(SIMDKernel):
                     scalar_locs = set(self._reduction_outputs)
                     broadcasted_scalars: dict[str, str] = {}
 
-                    def vectorize_operand(operand):
+                    def _vectorize_for_epilogue(operand):
                         if (
                             out_kind != "matrix"
                             or not isinstance(operand, str)
@@ -1268,7 +1268,7 @@ class TileLangKernel(SIMDKernel):
                                 f"'{tilelang_dtype(dtype)}')"
                             )
                             already_allocated.add(op_out_buf)
-                        operands = [vectorize_operand(operand) for operand in operands]
+                        operands = [_vectorize_for_epilogue(operand) for operand in operands]
                         operands = self._materialize_scalar_operands(
                             code, op_name, operands, dtype, scalar_cache
                         )
@@ -1278,10 +1278,7 @@ class TileLangKernel(SIMDKernel):
                 for _, (var, loc, _) in self._tl_outputs.items():
                     if var not in tensor_arg_names:
                         continue
-                    if self._reduction_output_extent(loc, tensor_arg_names) == "matrix":
-                        code.writeline(f"T.copy({loc}, {var}[cid, 0])")
-                    else:
-                        code.writeline(f"T.copy({loc}, {var}[cid, 0])")
+                    code.writeline(f"T.copy({loc}, {var}[cid, 0])")
 
         src = code.getvalue()
         print("====== TileLang reduction prim_func ======")
