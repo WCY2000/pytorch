@@ -49,6 +49,7 @@ def _check(name, fn, *inputs, rtol=rtol, atol=atol):
 N   = 1024
 x   = torch.randn(N, device=DEVICE, dtype=torch.float32)
 xp  = torch.rand(N,  device=DEVICE, dtype=torch.float32) + 0.1   # strictly positive
+xs  = torch.rand(N,  device=DEVICE, dtype=torch.float32) * 4.0 - 2.0  # in (-2, 2) for sin/cos
 y   = torch.randn(N, device=DEVICE, dtype=torch.float32)
 yp  = torch.rand(N,  device=DEVICE, dtype=torch.float32) + 0.1
 
@@ -121,8 +122,8 @@ _check("rsqrt   fp32  rsqrt(xp)", lambda x: torch.rsqrt(x),        xp)
 _check("abs     fp32  abs(x)",    lambda x: torch.abs(x),          x)
 _check("abs     fp16  abs(x)",    lambda x: torch.abs(x),          x16)
 _check("abs     int32 abs(x)",    lambda x: torch.abs(x),          xi32)
-_check("cos     fp32  cos(x)",    lambda x: torch.cos(x),          x)
-_check("sin     fp32  sin(x)",    lambda x: torch.sin(x),          x)
+_check("cos     fp32  cos(x)",    lambda x: torch.cos(x),          xs)
+_check("sin     fp32  sin(x)",    lambda x: torch.sin(x),          xs)
 _check("erf     fp32  erf(x)",    lambda x: torch.erf(x),          x)
 _check("tanh    fp32  tanh(x)",   lambda x: torch.tanh(x),         x)
 _check("neg     fp32  -x",        lambda x: -x,                    x)
@@ -161,7 +162,7 @@ _check("neg_exp  exp(-x)",
        lambda x: torch.exp(-x),                                     x)
 
 _check("cos_sin_add  cos(x)+sin(x)",
-       lambda x: torch.cos(x) + torch.sin(x),                      x)
+       lambda x: torch.cos(x) + torch.sin(x),                      xs)
 
 _check("tanh_scale  tanh(x*0.5)*2",
        lambda x: torch.tanh(x * 0.5) * 2.0,                        x)
@@ -278,7 +279,7 @@ _check("scale_bias 4D fp32",    lambda x, y, z: x * y + z,            x4, y4, xp
 # ===========================================================================
 print("\n========== Reductions (persistent, fp32) ==========")
 
-# Small N so the full row fits in L1 (< 4 KB for fp32)
+# # Small N so the full row fits in L1 (< 4 KB for fp32)
 M, N = 64, 128
 xr  = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
 xr16 = torch.randn(M, N, device=DEVICE, dtype=torch.float16)
