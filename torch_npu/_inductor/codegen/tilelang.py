@@ -820,8 +820,10 @@ class TileLangKernel(SIMDKernel):
         self._reduction_outputs[local_name] = (value, dtype)
         if name not in V.graph.removed_buffers:
             var = self.args.output(name)
-            if name not in self._tl_outputs:
-                self._tl_outputs[name] = (var, local_name, dtype)
+            # Unconditional overwrite: store() may run first (e.g. fused cast
+            # epilogue) and register the wrong _out_ptr*_local for this name.
+            # The reduction buffer must always win.
+            self._tl_outputs[name] = (var, local_name, dtype)
         self.stores.writeline(f"{local_name}[0] = {value}")
 
     # ------------------------------------------------------------------
@@ -1274,6 +1276,46 @@ class TileLangKernel(SIMDKernel):
                         )
                         code.writeline(self._emit_vec_op(op_name, operands, op_out_buf))
 
+                # ---- scalar epilogue: per-row outputs computed from reduction
+                # results but with no reduction index in their output index
+                # (e.g. mean = sum/N, or any f(reduction_result) per row).
+                # These are in _output_vars but NOT in vector_epilogue_locs.
+                scalar_epilogue_locs = {
+                    loc
+                    for loc in self._output_vars
+                    if loc not in self._reduction_outputs
+                    and loc not in vector_epilogue_locs
+                    and self._is_tensor_output_loc(loc, tensor_arg_names)
+                }
+                for out_loc in scalar_epilogue_locs:
+                    result_var, dtype = self._output_vars[out_loc]
+                    ops_list: list[tuple] = []
+                    src = _build_vec_ops(
+                        result_var,
+                        out_loc,
+                        ops_list,
+                        self._var_bufs,
+                        self._var_ops,
+                        self._var_consts,
+                    )
+                    if not ops_list:
+                        if src != out_loc:
+                            code.writeline(f"T.copy({src}, {out_loc})")
+                        continue
+                    last_op, last_operands, _ = ops_list[-1]
+                    ops_list[-1] = (last_op, last_operands, out_loc)
+                    for op_name, operands, op_out_buf in ops_list:
+                        if op_out_buf not in already_allocated:
+                            code.writeline(
+                                f"{op_out_buf} = T.alloc_shared((1, 1), "
+                                f"'{tilelang_dtype(dtype)}')"
+                            )
+                            already_allocated.add(op_out_buf)
+                        operands = self._materialize_scalar_operands(
+                            code, op_name, operands, dtype, scalar_cache
+                        )
+                        code.writeline(self._emit_vec_op(op_name, operands, op_out_buf))
+
                 code.writeline("")
                 for _, (var, loc, _) in self._tl_outputs.items():
                     if var not in tensor_arg_names:
@@ -1417,7 +1459,11 @@ class TileLangKernel(SIMDKernel):
         return var
 
     def should_use_persistent_reduction(self) -> bool:
-        return False
+        # TileLang NPU codegen uses T.reduce on the full reduction dimension in one
+        # shot (_RBLOCK = _rnumel). The persistent path in inductor matches this:
+        # it only calls store_reduction() and never emits the extra store() calls
+        # that the non-persistent path generates and that confuse our codegen.
+        return True
 
     def should_use_cooperative_reduction(self) -> bool:
         return False
