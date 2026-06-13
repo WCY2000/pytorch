@@ -692,3 +692,270 @@ TileLangKernel._emit_vec_op()
 | TileLang    | tilelang.py:1572       | reduction 类型白名单              | 拒绝融合        |
 | codegen拦截 | tilelang.py:1620       | template/split-scan/超量reduction | fallback Triton |
 | 运行时      | tilelang.py kernel方法 | dtype/op支持、tuple reduction     | fallback Triton |
+
+---
+
+# TileLang Matmul (T.gemm) Codegen
+
+## 1. 为什么 matmul 需要单独处理
+
+Pointwise/Reduction op（`torch.add`、`x.sum()`）经过 inductor lowering 后产出 `ComputedBuffer`，被 scheduler 包成 `SchedulerNode`，最终由 `TileLangKernel.codegen_kernel()` 生成 `T.vadd/T.reduce` 代码。
+
+`aten.mm` 走的是完全不同的路径：
+
+```
+aten.mm
+  → _register_npu_inductor_mm()  ← 必须显式注册
+  → autotune_select_algorithm([TileLangGemmCaller])
+  → TemplateBuffer (TemplateSchedulerNode)
+  → TileLangScheduling.codegen_template()
+  → T.gemm @T.prim_func
+```
+
+- 产出的是 `TemplateBuffer`，不是 `ComputedBuffer`
+- scheduler 把它包成 `TemplateSchedulerNode`，调 `codegen_template()` 而不是 `codegen_nodes()`
+- 如果没有注册 lowering，inductor 会尝试 `make_fallback(aten.mm)`，但 `aten.mm` 同时在 `decompositions` 里，触发断言：`both a fallback and a decomp for same op`
+
+因此 `__init__.py` 的 tilelang 分支必须额外调用：
+
+```python
+_register_npu_inductor_mm()
+_register_npu_inductor_addmm()   # nn.Linear(bias=True) → aten.addmm
+_register_npu_inductor_bmm()     # torch.bmm
+```
+
+---
+
+## 2. 完整 Pipeline
+
+```
+torch.mm(A, B)                        # 用户调用
+    │
+    ▼ Dynamo trace
+aten.mm.default(arg0, arg1)           # FX graph 节点
+    │
+    ▼ GraphLowering.run_node()
+_register_npu_inductor_mm() 里的 tuned_mm()
+    │
+    ├─ mm_args()                       # 规范化输入，得到 layout(dtype=fp16)
+    │
+    ├─ use_tilelang_template() == True?
+    │       TORCHINDUCTOR_NPU_BACKEND=tilelang
+    │       AND layout.dtype in {fp16, int8}
+    │
+    ├─ add_tilelang_gemm_choices(choices=[TileLangGemmCaller])
+    │       ↑ 覆盖 layout.dtype 为 accum_dtype(fp32)
+    │       ↑ 用 FixedLayout(dtype=fp32) 替换原 fp16 layout
+    │
+    ▼ autotune_select_algorithm(choices=[TileLangGemmCaller])
+    │       len(choices)==1 → choices[0].output_node()  (不做 benchmark)
+    │
+    ▼ TileLangGemmCaller.output_node()
+    │       TemplateBuffer(
+    │           layout=FixedLayout(fp32, size=[M,N]),
+    │           inputs=[mat1, mat2],
+    │           make_kernel_render=_TileLangGemmRender(params)
+    │       )
+    │
+    ▼ 调度阶段
+Scheduler.codegen()
+    │   node.is_template() == True
+    │
+    ▼ TileLangScheduling.codegen_template(template_node, epilogue_nodes)
+    │
+    ├─ 检测 isinstance(render, _TileLangGemmRender)  ← TileLang 标记
+    │       否 → 转发给 _triton_scheduling.codegen_template()
+    │
+    ├─ codegen_tilelang_mm_src(kernel_name, ...)    ← 生成 @T.prim_func 源码
+    │
+    ├─ define_kernel_matmul(src_code, ...)           ← 注入 wrapper 到 header
+    │
+    ├─ n.mark_run() for n in [template_node, *epilogue_nodes]
+    │
+    └─ wrapper.writeline(
+           "tilelang_mm_0(mat1, mat2, out, M, N, K)"
+       )
+```
+
+---
+
+## 3. 关键类与函数
+
+### `_TileLangGemmParams`（dataclass）
+
+存储生成 T.gemm kernel 所需的全部参数：
+
+```python
+@dataclasses.dataclass
+class _TileLangGemmParams:
+    M, N, K: Any           # sympy 表达式，工厂函数运行时解析为整数
+    dtype: torch.dtype     # 输入 dtype，e.g. float16
+    accum_dtype: torch.dtype # 累加 dtype，e.g. float32
+    block_M: int = 128
+    block_N: int = 128
+    block_K: int = 64
+```
+
+---
+
+### `_TileLangGemmRender`（marker 类）
+
+存储在 `TemplateBuffer.make_kernel_render` 字段，作为 TileLang matmul 的**类型标记**：
+
+```python
+class _TileLangGemmRender:
+    params: _TileLangGemmParams
+    def __call__(self, buf): raise NotImplementedError  # 不会被调用
+```
+
+`TileLangScheduling.codegen_template()` 用 `isinstance(render, _TileLangGemmRender)` 检测它，触发 T.gemm 代码生成路径。若不是该类型，则转发给 NPU Triton 处理。
+
+---
+
+### `TileLangGemmCaller(ChoiceCaller)`
+
+```python
+class TileLangGemmCaller(ChoiceCaller):
+    def output_node(self) -> TensorBox:
+        buf = TemplateBuffer(
+            layout=...,            # FixedLayout(fp32)
+            inputs=[mat1, mat2],
+            make_kernel_render=_TileLangGemmRender(params),
+        )
+        return TensorBox.create(buf)
+
+    def benchmark(self, *args, out=None) -> float:
+        return float("inf")        # 不参与 benchmark，确保单选时直接走 output_node()
+```
+
+---
+
+### `add_tilelang_gemm_choices()`
+
+注册 TileLang 为 `aten.mm` 的唯一候选（在 `mm.py` 的 `tuned_mm()` 里调用）：
+
+```python
+def add_tilelang_gemm_choices(choices, layout, input_nodes, ...):
+    dtype = mat1.get_dtype()           # fp16
+    accum_dtype = {fp16: fp32, int8: int32}[dtype]
+
+    # 关键：覆盖 layout 为 fp32，否则 inductor 分配 fp16 buffer
+    # 导致 T.gemm 写入 fp32 值被误读为 fp16 → 产生 nan/溢出
+    layout = FixedLayout(
+        device=layout.device,
+        dtype=accum_dtype,            # fp32
+        size=layout.size,
+        stride=[N, 1],                # 行优先 contiguous
+    )
+    choices.append(TileLangGemmCaller(...))
+```
+
+**为什么必须用 `FixedLayout` 而不是 `FlexibleLayout`：**
+当 mm 后跟 epilogue（`relu/sigmoid/scale`）时，inductor 在 `SchedulerNode._compute_attrs()` 里调用 `make_indexer()` 读取 mm 输出的访问模式。`FlexibleLayout.allow_indexing = False` 会触发断言。
+
+---
+
+### `codegen_tilelang_mm_src()`
+
+生成 `@T.prim_func` 源码字符串（形状通过工厂函数的 `_M/_N/_K` 变量注入）：
+
+```python
+import tilelang.language as T
+
+_block_M = 128
+_block_N = 128
+_block_K = 64
+
+@T.prim_func
+def tilelang_mm_0_prim_fn(
+    A: T.Tensor((_M, _K), 'float16'),
+    B: T.Tensor((_K, _N), 'float16'),
+    C: T.Tensor((_M, _N), 'float32'),
+):
+    with T.Kernel(T.ceildiv(_N, _block_N) * T.ceildiv(_M, _block_M),
+                  is_npu=True) as (cid, _):
+        by = cid // T.ceildiv(_N, _block_N)   # M tile 索引
+        bx = cid % T.ceildiv(_N, _block_N)    # N tile 索引
+
+        A_shared = T.alloc_shared((_block_M, _block_K), 'float16')
+        B_shared = T.alloc_shared((_block_K, _block_N), 'float16')
+        C_local  = T.alloc_fragment((_block_M, _block_N), 'float32')  # 片上累加器
+
+        for k in T.Pipelined(T.ceildiv(_K, _block_K), num_stages=2):
+            T.copy(A[by * _block_M, k * _block_K], A_shared)
+            T.copy(B[k * _block_K, bx * _block_N], B_shared)
+            T.gemm(A_shared, B_shared, C_local, initC=(k == 0))  # 昇腾 AIC cube 指令
+
+        T.copy(C_local, C[by * _block_M, bx * _block_N])
+```
+
+**分块映射：**
+
+| 变量 | 含义 |
+|---|---|
+| `cid` | 当前 AIC 核的 block 编号（`blockIdx.x`） |
+| `by` | C 矩阵 M 方向的 tile 编号 |
+| `bx` | C 矩阵 N 方向的 tile 编号 |
+| `A_shared` / `B_shared` | L1 缓冲（`shared.dyn`，FFTS 管理） |
+| `C_local` | 片上 fragment（`local.fragment`，cube 累加器） |
+| `T.gemm(..., initC=(k==0))` | k=0 时初始化 C_local，否则累加 |
+| `T.Pipelined(..., num_stages=2)` | 双缓冲流水，隐藏 DMA 延迟 |
+
+---
+
+### `define_kernel_matmul()`
+
+将 prim_func 包装为带形状缓存的调用函数，注入 `wrapper.header`：
+
+```python
+# 工厂函数：接受运行时 M/N/K，动态构造 prim_func
+def _prim_factory_tilelang_mm_0(M, N, K):
+    _M, _N, _K = M, N, K
+    import tilelang.language as T
+    @T.prim_func
+    def tilelang_mm_0_prim_fn(A, B, C): ...
+    return tilelang_mm_0_prim_fn
+
+# 形状缓存：相同形状复用已编译 binary
+_tilelang_mm_0_cache = {}
+
+def tilelang_mm_0(A, B, C, M, N, K):
+    _key = (int(M), int(N), int(K))
+    if _key not in _tilelang_mm_0_cache:
+        _tilelang_mm_0_cache[_key] = _tilelang_0.compile(
+            _prim_factory_tilelang_mm_0(*_key), target='npuir'
+        )
+    _tilelang_mm_0_cache[_key](A, B, C)
+```
+
+在 `output_code.py` 中对应的调用语句：
+
+```python
+tilelang_mm_0(arg1_1, arg0_1, buf0, 256, 512, 128)
+```
+
+---
+
+## 4. Dtype 处理
+
+T.gemm 在硬件上使用 AIC cube 单元计算，**输入 fp16，累加 fp32**。这与 `aten.mm(fp16, fp16)` 的默认返回 dtype（fp16）不同：
+
+| 阶段 | dtype |
+|---|---|
+| 输入 A / B | `float16`（原始用户数据） |
+| C_local（片上累加） | `float32`（防止精度损失） |
+| 输出 buffer C | `float32`（由 FixedLayout 保证） |
+| 用户可见输出 | `float32`（与 eager 对比时自动 cast） |
+
+---
+
+## 5. 与 NPU Triton / CATLASS 的对比
+
+| 特性 | NPU Triton | CATLASS | TileLang T.gemm |
+|---|---|---|---|
+| 触发条件 | 默认路径 | `use_catlass_template()` | `TORCHINDUCTOR_NPU_BACKEND=tilelang` |
+| 硬件指令 | AIV 向量 | AIC cube (CATLASS lib) | AIC cube (`hivm.hir.mmadL1`) |
+| 输出 dtype | fp16 | fp16 | fp32 |
+| Epilogue 融合 | ✅ | ✅ | ✅（fused mm+relu 等） |
+| 代码生成方式 | Triton JIT | C++ template | TileLang prim_func |
+| 调度路径 | `codegen_nodes()` | `codegen_template()` | `codegen_template()` |
