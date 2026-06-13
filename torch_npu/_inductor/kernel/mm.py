@@ -43,7 +43,7 @@ from torch._inductor.kernel.mm_common import (
 )
 
 from ..codegen.catlass.gemm_template import CATLASS1xGemmTemplate
-from ..utils import use_catlass_template, use_triton_template
+from ..utils import use_catlass_template, use_tilelang_template, use_triton_template
 
 
 log = logging.getLogger("torch._inductor")
@@ -84,22 +84,38 @@ def _register_npu_inductor_mm():
         m, n, k, layout, mat1, mat2 = mm_args(mat1, mat2, layout=layout)
         name = "mm"
 
+        _, is_nonzero = _is_static_problem(layout)
+        is_contiguous_input = (
+            is_contiguous_striding(mat1.get_size(), mat1.get_stride())
+            and is_contiguous_striding(mat2.get_size(), mat2.get_stride())
+        )
+
+        # TileLang T.gemm: use as the ONLY choice so select_algorithm returns
+        # output_node() directly without benchmarking (TileLang.benchmark()
+        # returns inf, so it loses whenever aten_mm is also a candidate).
+        if (
+            is_contiguous_input
+            and is_nonzero
+            and use_tilelang_template("mm", layout, m, n, k)
+        ):
+            from ..codegen.tilelang import add_tilelang_gemm_choices
+            tl_choices: list = []
+            add_tilelang_gemm_choices(tl_choices, layout, [mat1, mat2])
+            if tl_choices:
+                log.info("TileLang T.gemm selected as sole mm backend")
+                return autotune_select_algorithm(name, tl_choices, [mat1, mat2], layout)
+
         aten_layout = layout
         if not use_max_autotune():
             aten_layout = FlexibleLayout(
                 device=layout.device, dtype=layout.dtype, size=layout.size
             )
 
-        # options to tune from
+        # options to tune from (non-TileLang path)
         choices = (
             [aten_mm.bind((mat1, mat2), aten_layout)] if use_aten_gemm_kernels() else []
         )
-        _, is_nonzero = _is_static_problem(layout)
 
-        is_contiguous_input = (
-            is_contiguous_striding(mat1.get_size(), mat1.get_stride())
-            and is_contiguous_striding(mat2.get_size(), mat2.get_stride())
-        )
         if (
             is_contiguous_input
             and is_nonzero

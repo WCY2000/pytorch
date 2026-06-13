@@ -31,7 +31,7 @@ def patch_is_same_tensor():
             and data.untyped_storage().data_ptr() == value.untyped_storage().data_ptr()
             and data.storage_offset() == value.storage_offset()
         )
-    
+
     from torch._inductor import utils, graph
     utils.is_same_tensor = is_same_tensor
     # We need to do extra-patch because of code like `from xxx import is_same_tensor`
@@ -267,6 +267,23 @@ def use_catlass_template(op_name: str, layout: Layout, m: int, n: int, k: int) -
             return False
 
     return res
+
+
+def use_tilelang_template(op_name: str, layout: Layout, m: int, n: int, k: int) -> bool:
+    """Return True when TileLang T.gemm should be offered as a choice for *op_name*."""
+    import os
+    from torch._inductor.utils import _use_autotune_backend, use_max_autotune
+
+    # Only activate when TORCHINDUCTOR_NPU_BACKEND=tilelang (or the tilelang
+    # backend has been explicitly requested via the env-var / config).
+    if os.environ.get("TORCHINDUCTOR_NPU_BACKEND", "").lower() != "tilelang":
+        return False
+
+    # T.gemm supports fp16 (→fp32 accum) and int8 (→int32 accum) inputs.
+    if layout.dtype not in (torch.float16, torch.int8):
+        return False
+
+    return _use_template_for_npu(layout, [torch.float16, torch.int8])
 
 
 def triton_support_ffts():

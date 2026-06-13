@@ -44,6 +44,7 @@ Known limitations:
 """
 from __future__ import annotations
 
+import dataclasses
 import re
 from typing import Any, Optional, Sequence
 
@@ -61,6 +62,7 @@ from torch._inductor.codegen.common import (
     OpOverrides,
     TensorArg,
 )
+from torch._inductor.ir import ChoiceCaller, TemplateBuffer, TensorBox
 from torch._inductor.codegen.simd import (
     SIMDKernel,
     SIMDScheduling,
@@ -531,6 +533,267 @@ _DEFAULT_XBLOCK = 128
 
 
 _SUPPORTED_REDUCTIONS = frozenset({"sum", "max", "min"})
+
+
+# ---------------------------------------------------------------------------
+# Matmul (T.gemm) codegen
+# ---------------------------------------------------------------------------
+
+# Accumulation dtype for T.gemm: fp16 → fp32, int8 → int32
+_GEMM_ACCUM_DTYPE: dict[torch.dtype, torch.dtype] = {
+    torch.float16: torch.float32,
+    torch.int8:    torch.int32,
+}
+
+# Default tile sizes tuned for Ascend NPU cube units
+_MM_BLOCK_M = 128
+_MM_BLOCK_N = 128
+_MM_BLOCK_K = 64
+
+
+@dataclasses.dataclass
+class _TileLangGemmParams:
+    """Captures the parameters needed to generate a T.gemm kernel."""
+    M: Any
+    N: Any
+    K: Any
+    dtype: torch.dtype
+    accum_dtype: torch.dtype
+    block_M: int = _MM_BLOCK_M
+    block_N: int = _MM_BLOCK_N
+    block_K: int = _MM_BLOCK_K
+
+
+class _TileLangGemmRender:
+    """
+    Marker stored as ``TemplateBuffer.make_kernel_render``.
+
+    ``TileLangScheduling.codegen_template()`` checks ``isinstance(render,
+    _TileLangGemmRender)`` and routes to the TileLang T.gemm path.  The
+    base Triton template path never actually calls this object.
+    """
+
+    def __init__(self, params: _TileLangGemmParams) -> None:
+        self.params = params
+
+    def __call__(self, template_buf: Any) -> None:
+        raise NotImplementedError(
+            "TileLang T.gemm render is handled by TileLangScheduling.codegen_template(); "
+            "direct calls are not supported."
+        )
+
+
+class TileLangGemmCaller(ChoiceCaller):
+    """
+    ``ChoiceCaller`` that registers a TileLang T.gemm kernel as a candidate
+    for ``aten.mm`` / ``aten.addmm`` autotuning.
+
+    Register from ``mm.py``::
+
+        from torch_npu._inductor.codegen.tilelang import add_tilelang_gemm_choices
+        if use_tilelang_gemm(layout, m, n, k):
+            add_tilelang_gemm_choices(choices, layout, [mat1, mat2])
+    """
+
+    def __init__(
+        self,
+        name: str,
+        input_nodes: list,
+        layout: Any,
+        params: _TileLangGemmParams,
+        description: str = "",
+    ) -> None:
+        super().__init__(name, input_nodes, layout, description)
+        self.params = params
+
+    # ------------------------------------------------------------------
+    # ChoiceCaller interface
+    # ------------------------------------------------------------------
+
+    def hash_key(self) -> str:
+        p = self.params
+        return (
+            f"tilelang_mm_{tilelang_dtype(p.dtype)}_{tilelang_dtype(p.accum_dtype)}"
+            f"_bM{p.block_M}_bN{p.block_N}_bK{p.block_K}"
+        )
+
+    def output_node(self) -> TensorBox:
+        buf = TemplateBuffer(
+            layout=self.layout,
+            inputs=self.input_nodes,
+            make_kernel_render=_TileLangGemmRender(self.params),
+        )
+        return TensorBox.create(buf)
+
+    def to_callable(self) -> Any:
+        raise NotImplementedError("TileLangGemmCaller has no standalone callable")
+
+    def benchmark(self, *args, out=None) -> float:
+        # Benchmarking TileLang T.gemm via the inductor autotuner is not yet
+        # supported (requires a compiled NPU binary).  Return a large time so
+        # that benchmarked ATEN / CATLASS choices win if they are also present.
+        # In the common single-choice path this is never called.
+        return float("inf")
+
+    def call_name(self) -> str:
+        return f"tilelang_mm.{self.name}"
+
+    def get_make_kernel_render(self) -> _TileLangGemmRender:
+        return _TileLangGemmRender(self.params)
+
+
+def add_tilelang_gemm_choices(
+    choices: list,
+    layout: Any,
+    input_nodes: list,
+    *,
+    block_M: int = _MM_BLOCK_M,
+    block_N: int = _MM_BLOCK_N,
+    block_K: int = _MM_BLOCK_K,
+) -> None:
+    """
+    Add a ``TileLangGemmCaller`` to *choices* for ``aten.mm`` autotuning.
+
+    Typical usage in ``mm.py``::
+
+        from torch_npu._inductor.codegen.tilelang import add_tilelang_gemm_choices
+        if use_tilelang_gemm(layout, m, n, k):
+            add_tilelang_gemm_choices(choices, layout, [mat1, mat2])
+    """
+    mat1, mat2 = input_nodes[0], input_nodes[1]
+    dtype = mat1.get_dtype()
+    accum_dtype = _GEMM_ACCUM_DTYPE.get(dtype)
+    if accum_dtype is None:
+        return  # dtype not supported by T.gemm
+    M = mat1.get_size()[0]
+    K = mat1.get_size()[1]
+    N = mat2.get_size()[1]
+    params = _TileLangGemmParams(
+        M=M, N=N, K=K,
+        dtype=dtype,
+        accum_dtype=accum_dtype,
+        block_M=block_M,
+        block_N=block_N,
+        block_K=block_K,
+    )
+
+    # T.gemm accumulates in accum_dtype (fp32 for fp16 input) and writes fp32
+    # to the output buffer.  Override the layout so inductor allocates the
+    # correctly-typed buffer instead of the input dtype (fp16), which would
+    # cause the fp32 bits to be reinterpreted as fp16 → garbage results.
+    #
+    # Must use FixedLayout (not FlexibleLayout): when the mm result is read by
+    # a fused epilogue (relu/sigmoid/scale), the scheduler calls make_indexer()
+    # on the output layout; FlexibleLayout.allow_indexing is False and asserts.
+    if layout.dtype != accum_dtype:
+        from torch._inductor.ir import FixedLayout
+        size = list(layout.size)
+        # Compute contiguous row-major strides (stride[-1]=1, stride[i]=stride[i+1]*size[i+1])
+        stride = [sympy.Integer(1)] * len(size)
+        for i in range(len(size) - 2, -1, -1):
+            stride[i] = stride[i + 1] * size[i + 1]
+        layout = FixedLayout(
+            device=layout.device,
+            dtype=accum_dtype,
+            size=size,
+            stride=stride,
+        )
+
+    desc = (
+        f"TileLang T.gemm {tilelang_dtype(dtype)}->{tilelang_dtype(accum_dtype)} "
+        f"bM{block_M}_bN{block_N}_bK{block_K}"
+    )
+    choices.append(
+        TileLangGemmCaller(
+            name="tilelang_mm",
+            input_nodes=input_nodes,
+            layout=layout,
+            params=params,
+            description=desc,
+        )
+    )
+
+
+def codegen_tilelang_mm_src(
+    name: str,
+    *,
+    block_M: int,
+    block_N: int,
+    block_K: int,
+    dtype: torch.dtype,
+    accum_dtype: torch.dtype,
+) -> str:
+    """
+    Return a TileLang ``@T.prim_func`` source string for matrix multiplication.
+
+    The generated kernel uses ``T.gemm`` to compute ``C = A @ B`` where:
+    - ``A`` has shape ``(_M, _K)`` and dtype *dtype*
+    - ``B`` has shape ``(_K, _N)`` and dtype *dtype*
+    - ``C`` has shape ``(_M, _N)`` and dtype *accum_dtype* (fp32 for fp16 input)
+
+    ``_M``, ``_N``, ``_K`` are injected by the factory function wrapper.
+    """
+    tl_dtype  = tilelang_dtype(dtype)
+    tl_accum  = tilelang_dtype(accum_dtype)
+    prim_name = f"{name}_prim_fn"
+
+    code = IndentedBuffer()
+    code.writeline("import tilelang.language as T")
+    code.writeline("")
+    code.writeline(f"_block_M = {block_M}")
+    code.writeline(f"_block_N = {block_N}")
+    code.writeline(f"_block_K = {block_K}")
+    code.writeline("")
+    code.writeline("@T.prim_func")
+    code.writeline(f"def {prim_name}(")
+    with code.indent():
+        code.writeline(f"A: T.Tensor((_M, _K), '{tl_dtype}'),")
+        code.writeline(f"B: T.Tensor((_K, _N), '{tl_dtype}'),")
+        code.writeline(f"C: T.Tensor((_M, _N), '{tl_accum}'),")
+    code.writeline("):")
+    with code.indent():
+        code.writeline(
+            "with T.Kernel("
+            "T.ceildiv(_N, _block_N) * T.ceildiv(_M, _block_M), "
+            "is_npu=True) as (cid, _):"
+        )
+        with code.indent():
+            code.writeline("by = cid // T.ceildiv(_N, _block_N)")
+            code.writeline("bx = cid % T.ceildiv(_N, _block_N)")
+            code.writeline("")
+            code.writeline(
+                f"A_shared = T.alloc_shared((_block_M, _block_K), '{tl_dtype}')"
+            )
+            code.writeline(
+                f"B_shared = T.alloc_shared((_block_K, _block_N), '{tl_dtype}')"
+            )
+            code.writeline(
+                f"C_local = T.alloc_fragment((_block_M, _block_N), '{tl_accum}')"
+            )
+            code.writeline("")
+            code.writeline(
+                "for k in T.Pipelined(T.ceildiv(_K, _block_K), num_stages=2):"
+            )
+            with code.indent():
+                code.writeline(
+                    "T.copy(A[by * _block_M, k * _block_K], A_shared)"
+                )
+                code.writeline(
+                    "T.copy(B[k * _block_K, bx * _block_N], B_shared)"
+                )
+                code.writeline(
+                    "T.gemm(A_shared, B_shared, C_local, initC=(k == 0))"
+                )
+            code.writeline("")
+            code.writeline(
+                "T.copy(C_local, C[by * _block_M, bx * _block_N])"
+            )
+    src = code.getvalue()
+    print("====== TileLang T.gemm prim_func ======")
+    print(src)
+    return src
+
+
 _MAX_REDUCTIONS_PER_KERNEL = 2
 
 
@@ -1502,6 +1765,178 @@ class TileLangScheduling(NPUTritonScheduling):
 
     def codegen_sync(self) -> None:
         V.graph.wrapper_code.writeline("torch.npu.synchronize()")
+
+    # ------------------------------------------------------------------
+    # TileLang T.gemm (matmul) codegen
+    # ------------------------------------------------------------------
+
+    def define_kernel_matmul(
+        self,
+        src_code: str,
+        node_schedule: list,
+        kernel_name: str,
+    ) -> str:
+        """
+        Splice a TileLang T.gemm kernel factory + cache + wrapper into
+        ``wrapper.header``.
+
+        Pattern emitted at module level::
+
+            import tilelang as _tilelang_<N>
+
+            def _prim_factory_<name>(M, N, K):
+                _M, _N, _K = M, N, K
+                # @T.prim_func definition (src_code)
+                return <name>_prim_fn
+
+            _<name>_cache = {}
+
+            def <name>(A, B, C, M, N, K):
+                _key = (int(M), int(N), int(K))
+                if _key not in _<name>_cache:
+                    _<name>_cache[_key] = _tilelang_<N>.compile(
+                        _prim_factory_<name>(*_key), target='npuir')
+                _<name>_cache[_key](A, B, C)
+        """
+        wrapper = V.graph.wrapper_code
+
+        if src_code in wrapper.src_to_kernel:
+            return wrapper.src_to_kernel[src_code]
+
+        wrapper.src_to_kernel[src_code] = kernel_name
+        src_code_final = src_code.replace(str(Placeholder.KERNEL_NAME), kernel_name)
+
+        tl_pkg_root: Optional[str] = None
+        try:
+            import tilelang as _tl
+            import os as _os
+            tl_pkg_root = _os.path.dirname(_os.path.dirname(_tl.__file__))
+        except ImportError:
+            pass
+
+        suffix       = kernel_name.rsplit("_", 1)[-1]
+        import_alias = f"_tilelang_{suffix}"
+        cache_var    = f"_{kernel_name}_cache"
+        factory_fn   = f"_prim_factory_{kernel_name}"
+        prim_fn_name = f"{kernel_name}_prim_fn"
+
+        origins, detailed = get_kernel_metadata(node_schedule, wrapper)
+        meta_comment = f"{origins}\n{detailed}".strip()
+
+        code = IndentedBuffer()
+        code.writeline(f"\n# TileLang T.gemm kernel - {meta_comment}")
+        if tl_pkg_root:
+            code.writeline("import sys as _sys")
+            code.writeline(
+                f"if {tl_pkg_root!r} not in _sys.path: "
+                f"_sys.path.insert(0, {tl_pkg_root!r})"
+            )
+        code.writeline(f"import tilelang as {import_alias}")
+        code.writeline("")
+
+        code.writeline(f"def {factory_fn}(M, N, K):")
+        with code.indent():
+            code.writeline("_M = M")
+            code.writeline("_N = N")
+            code.writeline("_K = K")
+            code.splice(src_code_final)
+            code.writeline(f"return {prim_fn_name}")
+
+        code.writeline("")
+        code.writeline(f"{cache_var} = {{}}")
+        code.writeline("")
+
+        code.writeline(f"def {kernel_name}(A, B, C, M, N, K):")
+        with code.indent():
+            code.writeline("_key = (int(M), int(N), int(K))")
+            code.writeline(f"if _key not in {cache_var}:")
+            with code.indent():
+                code.writeline(f"{cache_var}[_key] = {import_alias}.compile(")
+                with code.indent():
+                    code.writeline(
+                        f"{factory_fn}(_key[0], _key[1], _key[2]), target='npuir'"
+                    )
+                code.writeline(")")
+            code.writeline(f"{cache_var}[_key](A, B, C)")
+
+        generated = code.getvalue()
+        print("====== TileLang T.gemm wrapper ======")
+        print(generated)
+        wrapper.header.splice(generated)
+        return kernel_name
+
+    def codegen_template(
+        self,
+        template_node,
+        epilogue_nodes: list,
+        only_gen_src_code: bool = False,
+    ):
+        """
+        Intercept TileLang T.gemm templates; delegate everything else to the
+        NPU Triton scheduling backend.
+
+        A template is recognised as TileLang when its ``TemplateBuffer``'s
+        ``make_kernel_render`` attribute is a ``_TileLangGemmRender`` instance,
+        which is set by ``TileLangGemmCaller.output_node()``.
+        """
+        ir_node = template_node.node
+        render  = getattr(ir_node, "make_kernel_render", None)
+
+        if not isinstance(render, _TileLangGemmRender):
+            # Not a TileLang template — let the NPU Triton path handle it.
+            return self._triton_scheduling.codegen_template(
+                template_node, epilogue_nodes, only_gen_src_code
+            )
+
+        params = render.params
+
+        # Build a unique kernel name.
+        fused_name = (
+            get_fused_kernel_name(
+                [template_node, *epilogue_nodes],
+                config.triton.descriptive_names,
+            )
+            if config.triton.descriptive_names
+            else ""
+        )
+        suffix      = V.graph.wrapper_code.next_kernel_suffix()
+        kernel_name = "_".join(filter(None, ["tilelang_mm", fused_name, suffix]))
+
+        # Generate T.gemm prim_func source.
+        src_code = codegen_tilelang_mm_src(
+            kernel_name,
+            block_M=params.block_M,
+            block_N=params.block_N,
+            block_K=params.block_K,
+            dtype=params.dtype,
+            accum_dtype=params.accum_dtype,
+        )
+
+        if only_gen_src_code:
+            return src_code
+
+        node_schedule = [template_node, *epilogue_nodes]
+        self.define_kernel_matmul(src_code, node_schedule, kernel_name)
+
+        # Allocate the output buffer and mark all nodes as run.
+        for n in [template_node, *epilogue_nodes]:
+            n.mark_run()
+
+        # Resolve tensor argument names and matrix dimensions.
+        wrapper  = V.graph.wrapper_code
+        mat1_ref = ir_node.inputs[0].codegen_reference()
+        mat2_ref = ir_node.inputs[1].codegen_reference()
+        out_name = ir_node.get_name()
+        M_expr   = str(params.M)
+        N_expr   = str(params.N)
+        K_expr   = str(params.K)
+
+        wrapper.writeline(
+            f"{kernel_name}({mat1_ref}, {mat2_ref}, {out_name}, "
+            f"{M_expr}, {N_expr}, {K_expr})"
+        )
+
+        self.scheduler.free_buffers()
 
     def _fallback_to_triton(self, node, reason: str):
         schedule_log.debug("TileLang fallback to NPU Triton: %s", reason)

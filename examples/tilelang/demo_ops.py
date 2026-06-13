@@ -28,6 +28,9 @@ def _check(name, fn, *inputs, rtol=rtol, atol=atol):
     compiled = torch.compile(fn, backend="inductor")
     ref = fn(*inputs)
     out = compiled(*inputs)
+    # Cast ref to compiled output dtype (e.g. T.gemm accumulates fp16 → fp32)
+    if ref.dtype != out.dtype:
+        ref = ref.to(out.dtype)
     flat_ref = ref.flatten()
     flat_out = out.flatten()
     vals_ref = [f"{v:.4f}" for v in flat_ref[:4].tolist()]
@@ -309,6 +312,60 @@ xr2 = torch.randn(M2, N2, device=DEVICE, dtype=torch.float16)
 
 _check("sum  32x512 fp32  dim=1",
        lambda x: x.sum(dim=1, keepdim=True),   xr2)
+
+
+# ===========================================================================
+# GEMM / matmul — T.gemm path
+#
+# Supported input dtype : fp16  (accumulates in fp32)
+# Tile sizes             : block_M=128, block_N=128, block_K=64
+#
+# TileLang is selected as the matmul backend when
+#   TORCHINDUCTOR_NPU_BACKEND=tilelang  (already set at the top of this file)
+#   and mat1.dtype is fp16 or int8.
+#
+# The codegen path:
+#   add_tilelang_gemm_choices()  →  TileLangGemmCaller.output_node()
+#   →  TileLangScheduling.codegen_template()  →  codegen_tilelang_mm_src()
+#   →  tilelang.compile(..., target='npuir')
+# ===========================================================================
+print("\n========== GEMM — aten.mm fp16 (square) ==========")
+
+# _check casts ref to out.dtype for fair comparison (T.gemm returns fp32)
+for _sz in [256, 512, 1024]:
+    _A = torch.randn(_sz, _sz, device=DEVICE, dtype=torch.float16)
+    _B = torch.randn(_sz, _sz, device=DEVICE, dtype=torch.float16)
+    _check(f"mm fp16 {_sz}x{_sz}@{_sz}x{_sz}",
+           lambda a, b: torch.mm(a, b), _A, _B)
+
+print("\n========== GEMM — aten.mm fp16 (non-square) ==========")
+
+for _M, _N, _K in [(256, 512, 128), (128, 1024, 256), (512, 128, 256)]:
+    _A = torch.randn(_M, _K, device=DEVICE, dtype=torch.float16)
+    _B = torch.randn(_K, _N, device=DEVICE, dtype=torch.float16)
+    _check(f"mm fp16 {_M}x{_K}@{_K}x{_N}",
+           lambda a, b: torch.mm(a, b), _A, _B)
+
+print("\n========== GEMM — fused mm + elementwise (fp16) ==========")
+
+_M, _N, _K = 512, 512, 256
+_A = torch.randn(_M, _K, device=DEVICE, dtype=torch.float16)
+_B = torch.randn(_K, _N, device=DEVICE, dtype=torch.float16)
+
+_check("mm+relu    fp16",
+       lambda a, b: torch.relu(torch.mm(a, b)),    _A, _B)
+_check("mm+sigmoid fp16",
+       lambda a, b: torch.sigmoid(torch.mm(a, b)), _A, _B)
+_check("mm+scale   fp16  out*0.5+1.0",
+       lambda a, b: torch.mm(a, b) * 0.5 + 1.0,   _A, _B)
+
+print("\n========== GEMM — torch.nn.Linear (fp16, no bias) ==========")
+
+for _in_f, _out_f, _batch in [(256, 512, 128), (512, 1024, 64)]:
+    _linear = torch.nn.Linear(_in_f, _out_f, bias=False).half().to(DEVICE)
+    _x = torch.randn(_batch, _in_f, device=DEVICE, dtype=torch.float16)
+    _check(f"Linear no-bias {_batch}x{_in_f}→{_batch}x{_out_f}",
+           _linear, _x)
 
 
 # ===========================================================================

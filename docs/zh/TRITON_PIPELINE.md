@@ -472,3 +472,223 @@ NPUCombinedScheduling.codegen_node(fused_node)
 | `ASCEND_RT_VISIBLE_DEVICES` | `autotune_process.py` | 多卡 autotune 时可见设备列表 |
 | `npu_config.dump_fx_graph` | `scheduling.py` | 导出 FX graph 用于精度比对/fallback |
 | `npu_config.check_accuracy` | `npu_triton_heuristics.py` | 运行时对比 Triton kernel 与 FX graph 输出 |
+
+
+
+
+
+# 融合策略
+
+## `NPUTritonScheduling.can_fuse`（scheduling.py）
+
+完整的融合策略，分四种情况：
+
+
+
+```
+1. Reduction + Reduction
+   → numel1 == numel2 AND rnumel1 == rnumel2 才能融合
+
+2. Pointwise + Pointwise  
+   → numel/rnumel 匹配
+   → 检查合并后的 tiling 是否一致（防止 tiling 冲突）
+
+3. Pointwise → Reduction（标量/向量 epilogue）
+   → pointwise_numel == reduction_numel：scalar epilogue（每行一个值）
+   → pointwise_numel == reduction_numel × rnumel：vector epilogue（每个元素）
+   → 检查 SIMDKernel.is_compatible 确保 ranges 兼容
+
+4. Reduction → Pointwise
+   → 等价于 case 3（swap 参数）
+```
+
+------
+
+## `TileLangScheduling.can_fuse`（tilelang.py）
+
+在 NPUTriton 的基础上加了 **TileLang 专属的限制层**：
+
+
+
+```python
+def can_fuse(self, node1, node2):
+    # ① Reduction + Reduction：只允许特定组合
+    if node1.is_reduction() and node2.is_reduction():
+        if not _is_supported_reduction_fusion(node1, node2):
+            return False       # 只允许 [max,sum] 或 [sum,sum]
+        return super().can_fuse(...)
+
+    # ② Reduction + Pointwise（或反向）
+    if node1.is_reduction() != node2.is_reduction():
+        # vector epilogue 只允许 max+sum / sum+sum / sum
+        if is_vector_epilogue and reduction_types not in [...]:
+            return False
+        # scalar epilogue：pointwise_numel == reduction_numel 且 rnumel==1
+        if same_numel(pointwise_numel, reduction_numel):
+            return SIMDKernel.is_compatible(...)
+
+    # ③ 其余情况全部交给 NPUTriton
+    return super().can_fuse(node1, node2)
+```
+
+再加上 `codegen_node` 里的额外拦截：
+
+
+
+```python
+def _unsupported_tilelang_reason(nodes, ...):
+    # 超过 2 个 reduction → 回退 Triton
+    # 含 template 节点 → 回退 Triton
+    # 含 split-scan 节点 → 回退 Triton
+```
+
+------
+
+## 两者差异对比
+
+| 场景                  | NPUTriton               | TileLang                            |
+| --------------------- | ----------------------- | ----------------------------------- |
+| Reduction + Reduction | numel/rnumel 匹配即可   | 只允许 `[max,sum]` / `[sum,sum]`    |
+| Vector epilogue       | 支持所有 reduction 类型 | 仅限 max+sum / sum+sum / sum        |
+| Scalar epilogue       | 支持所有                | 同上                                |
+| Template 节点         | 支持（TritonTemplate）  | 直接回退 Triton                     |
+| Split-scan            | 有条件支持              | 直接回退 Triton                     |
+| 兜底                  | 自己决定                | `super().can_fuse()` 交给 NPUTriton |
+
+**本质区别**：NPUTriton 是完整实现，TileLang 是在它之上做了"白名单"过滤——只有 TileLang 已经支持的 reduction 模式才自己处理，其余全部 fallback 到 NPUTriton。
+
+
+
+## 融合限制总览（从外到内，按拦截顺序）
+
+------
+
+### 第一层：距离限制（全局，scheduling.py:63）
+
+
+
+```python
+proximity_score = max(
+    abs(node1.min_order - node2.max_order),
+    abs(node2.min_order - node1.max_order),
+)
+# NPU A5 阈值 20（GPU 是 64）
+return proximity_score > 20   # True → 阻止融合
+```
+
+目的：防止 horizontal fusion 拉长 tensor 的 live interval，增加内存峰值。
+
+------
+
+### 第二层：NPUTritonScheduling.can_fuse（scheduling.py:474）
+
+按场景分支：
+
+
+
+```
+① ForeachKernel 节点
+   → 交给 ForeachKernelSchedulerNode.can_fuse
+
+② node1 含 cat_store
+   → 直接 False
+
+③ Split-scan + Reduction
+   → False
+
+④ Reduction + Reduction
+   → numel1 == numel2 AND rnumel1 == rnumel2 才允许
+
+⑤ Pointwise + Pointwise
+   → numel/rnumel 必须匹配（除非是 template prologue 特殊路径）
+   → 只允许 TritonTemplate，不允许 CUDATemplate
+   → config.triton.tiling_prevents_pointwise_fusion 开启时：
+       合并后的 tiling 必须与各自 tiling 一致
+
+⑥ Pointwise → Reduction（或反向）
+   → vector epilogue（numel_pw == numel_r × rnumel_r）：
+       - SIMDKernel.is_compatible 检查 ranges 兼容
+       - config.triton.tiling_prevents_reduction_fusion 开启时检查 tiling
+   → scalar epilogue（numel_pw == numel_r）：
+       - 直接允许
+   → 其他 numel 关系：不允许
+```
+
+------
+
+### 第三层：TileLangScheduling.can_fuse（tilelang.py:1572）
+
+在 NPUTriton 基础上叠加更严格的限制：
+
+
+
+```
+① Reduction + Reduction
+   → 只允许 ["max","sum"] 或 ["sum","sum"] 序列
+   → 其余（如 ["min","sum"]）直接 False
+
+② Reduction + Pointwise（或反向）
+   → 已融合的 reduction 若超过 1 个，序列必须是 ["max","sum"] 或 ["sum","sum"]
+   → vector epilogue 时，reduction 类型只允许 ["max","sum"] / ["sum","sum"] / ["sum"]
+   → scalar/vector epilogue：pointwise_rnumel 必须为 1
+   → SIMDKernel.is_compatible 检查所有 pointwise 节点
+
+③ 其余情况
+   → 交给 super().can_fuse()（NPUTritonScheduling）
+```
+
+------
+
+### 第四层：codegen_node 拦截（tilelang.py:1620）
+
+`can_fuse` 通过后，真正生成代码前的最后一道门：
+
+
+
+```python
+def _unsupported_tilelang_reason(nodes, ...):
+    if len(reduction_nodes) > 2:      # _MAX_REDUCTIONS_PER_KERNEL = 2
+        → fallback Triton
+    if any node.is_template():
+        → fallback Triton
+    if any node.is_split_scan():
+        → fallback Triton
+```
+
+------
+
+### 第五层：kernel 运行时 NotImplementedError → fallback Triton
+
+`SIMDScheduling.codegen_node` 用 `try/except NotImplementedError` 包住整个 kernel 生成：
+
+
+
+```
+TileLangKernel.load()
+   → dtype 不在 _ANY_SUPPORTED_DTYPE → NotImplementedError
+
+TileLangKernel.store()
+   → mode == "atomic_add" → NotImplementedError
+   → _check_op_graph_dtype() 发现 op 不支持该 dtype → NotImplementedError
+
+TileLangKernel.reduction()
+   → value 是 tuple → NotImplementedError
+   → reduction_type 不在 {"sum","max","min"} → NotImplementedError
+   → 超过 2 个 reduction → NotImplementedError
+   → 序列不是 ["max","sum"] / ["sum","sum"] → NotImplementedError
+
+TileLangKernel._emit_vec_op()
+   → op 没有对应的 T.v* → NotImplementedError
+```
+
+------
+
+### 汇总表
+
+| 层次        | 位置                   | 判断依据                          | 结果            |
+| ----------- | ---------------------- | --------------------------------- | --------------- |
+| 距离        | scheduling.py:85       | `order` 差值 > 20                 | 拒绝融合        |
+| NPUTriton   | scheduling.py:474      | numel/rnumel/tiling/template      | 拒绝融合        |
+| TileLang    | tilelang.py:1572       | reduction 类型白名单              | 拒绝融合        |
+| codegen拦截 | tilelang.py:1620       | template/split-scan/超量reduction | fallback Triton |
+| 运行时      | tilelang.py kernel方法 | dtype/op支持、tuple reduction     | fallback Triton |

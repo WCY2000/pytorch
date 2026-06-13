@@ -34,6 +34,11 @@ elif os.getenv('TORCHINDUCTOR_NPU_BACKEND', 'default') == 'tilelang':
     from .codecache import patch_cache_base_get_system
     from .utils import patch_is_gpu, patch_has_triton, disable_foreach
     from .scheduler import patch_scheduler
+    from .kernel import (
+        _register_npu_inductor_mm,
+        _register_npu_inductor_addmm,
+        _register_npu_inductor_bmm,
+    )
 
     register_backend_for_device('npu', TileLangScheduling, NPUWrapperCodeGen, CppWrapperNpu)
     register_device_op_overrides('npu', NewNPUDeviceOpOverrides())
@@ -44,6 +49,9 @@ elif os.getenv('TORCHINDUCTOR_NPU_BACKEND', 'default') == 'tilelang':
     inductor_lowering.make_fallback = npu_make_fallback
     _register_npu_inductor_decompositons()
     _register_npu_inductor_fallbacks()
+    _register_npu_inductor_mm()
+    _register_npu_inductor_addmm()
+    _register_npu_inductor_bmm()
 
     patch_cache_base_get_system()
     patch_is_gpu()
