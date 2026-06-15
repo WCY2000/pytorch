@@ -74,6 +74,20 @@ def is_contiguous_striding(size, stride) -> bool:
     )
 
 
+def is_row_major_striding(size, stride) -> bool:
+    """Return True only for row-major contiguous layout (stride[-1]==1, stride[-2]==size[-1]).
+
+    TileLang T.gemm uses T.copy assuming row-major tile access.  Col-major
+    inputs (e.g. weight.T from nn.Linear) must NOT go through this path —
+    Ascend DMA does not guarantee correct copy from col-major 2-D regions,
+    producing wrong matmul results.
+    """
+    return (
+        V.graph.sizevars.statically_known_equals(stride[1], 1)
+        and V.graph.sizevars.statically_known_equals(stride[0], size[1])
+    )
+
+
 def _register_npu_inductor_mm():
     @register_lowering(aten.mm, type_promotion_kind=None)
     def tuned_mm(mat1, mat2, *, layout=None):
@@ -89,12 +103,19 @@ def _register_npu_inductor_mm():
             is_contiguous_striding(mat1.get_size(), mat1.get_stride())
             and is_contiguous_striding(mat2.get_size(), mat2.get_stride())
         )
+        # TileLang T.copy assumes row-major layout for both A and B tiles.
+        # Col-major inputs (e.g. weight.T from nn.Linear, stride=[1, K]) cause
+        # wrong results because Ascend DMA reads tiles with wrong strides.
+        is_row_major_input = (
+            is_row_major_striding(mat1.get_size(), mat1.get_stride())
+            and is_row_major_striding(mat2.get_size(), mat2.get_stride())
+        )
 
         # TileLang T.gemm: use as the ONLY choice so select_algorithm returns
         # output_node() directly without benchmarking (TileLang.benchmark()
         # returns inf, so it loses whenever aten_mm is also a candidate).
         if (
-            is_contiguous_input
+            is_row_major_input
             and is_nonzero
             and use_tilelang_template("mm", layout, m, n, k)
         ):
