@@ -32,17 +32,29 @@ model = torch.compile(model, backend="inductor")
 ├── SIMDKernel
 │   └── TritonKernel
 │       └── NPUIndexTritonKernel     (triton.py)   ← NPU Triton kernel
-│           └── TileLangKernel       (tilelang.py)  ← TileLang kernel
+│           └── TileLangKernel       (tilelang.py)  ← TileLang pointwise/reduction kernel
 │
 └── SIMDScheduling
     └── TritonScheduling
         └── NPUTritonScheduling      (scheduling.py) ← NPU Triton scheduler
             └── TileLangScheduling   (tilelang.py)   ← TileLang scheduler
+                                        ├── codegen_template()  ← T.gemm matmul 路径
+                                        ├── define_kernel_matmul()
+                                        └── define_kernel()     ← pointwise/reduction 路径
 ```
 
 `TileLangKernel` 继承 `NPUIndexTritonKernel` 的目的是复用其 range tree 基础设施和 axis 分析管道（`decide_codegen_dims_in_kernel`），同时通过完整覆写 `load/store/reduction/codegen_kernel` 来生成 TileLang 代码而非 Triton 代码。
 
-`TileLangScheduling` 继承 `NPUTritonScheduling` 以复用完整的 scheduling 流程（包括 SplitTiling、ReductionAnalysis），仅覆写 `__init__`（强制 `self.kernel_type = TileLangKernel`）、`define_kernel` 和 `codegen_sync`。
+`TileLangScheduling` 继承 `NPUTritonScheduling` 以复用完整的 scheduling 流程（包括 SplitTiling、ReductionAnalysis），覆写 `__init__`（强制 `self.kernel_type = TileLangKernel`）、`define_kernel`、`codegen_sync`，以及新增的 `codegen_template()`（T.gemm matmul 路径）和 `define_kernel_matmul()`。
+
+### 两条 Codegen 路径
+
+TileLang 后端有两条完全独立的 codegen 路径：
+
+| 路径 | 适用 Op | 触发条件 | 调度节点类型 |
+|---|---|---|---|
+| **Pointwise / Reduction** | 逐元素、归约 | 所有 `ComputedBuffer` | `SchedulerNode` / `FusedSchedulerNode` |
+| **T.gemm Matmul** | `aten.mm` / `aten.addmm` / `aten.bmm` | 行优先 fp16/int8 输入 | `TemplateSchedulerNode` |
 
 ---
 
@@ -127,6 +139,60 @@ NPUTritonScheduling.codegen_node_schedule()          ← 继承自 NPUTritonSche
 
 ---
 
+## Matmul (T.gemm) Pipeline
+
+`aten.mm` 走与 pointwise/reduction **完全不同**的路径，产出 `TemplateBuffer` 而非 `ComputedBuffer`。
+
+```
+torch.mm(A, B)  /  torch.nn.Linear(bias=False)
+        │
+        ▼ _register_npu_inductor_mm() 注册的 lowering
+tuned_mm(mat1, mat2)   [kernel/mm.py]
+        │
+        ├─ is_row_major_striding(mat1) AND is_row_major_striding(mat2)?
+        │       否（如 weight.T 列优先）→ fallback: aten_mm / CATLASS
+        │
+        ├─ use_tilelang_template() == True?
+        │       TORCHINDUCTOR_NPU_BACKEND=tilelang AND dtype ∈ {fp16, int8}
+        │
+        └─ add_tilelang_gemm_choices(choices=[TileLangGemmCaller])
+                │  override layout: FixedLayout(dtype=fp32)  ← 防 fp16 buffer 误解 fp32 数据
+                │
+                ▼ autotune_select_algorithm(choices=[TileLangGemmCaller])
+                │       单 choice → choices[0].output_node()（不 benchmark）
+                │
+                ▼ TileLangGemmCaller.output_node()
+                        TemplateBuffer(
+                            layout = FixedLayout(fp32, size=[M,N], stride=[N,1]),
+                            inputs = [mat1, mat2],
+                            make_kernel_render = _TileLangGemmRender(params)
+                        )
+        │
+        ▼ 调度阶段：scheduler 看到 is_template() == True
+Scheduler.codegen() → TileLangScheduling.codegen_template(template_node, epilogue_nodes)
+        │
+        ├─ isinstance(render, _TileLangGemmRender)?
+        │       否 → _triton_scheduling.codegen_template()
+        │
+        ├─ codegen_tilelang_mm_src(kernel_name, ...)   → @T.prim_func 源码字符串
+        │
+        ├─ define_kernel_matmul(src_code, ...)          → 注入 factory wrapper 到 header
+        │
+        ├─ n.mark_run() for n in [template_node, *epilogue_nodes]
+        │
+        └─ wrapper.writeline(
+               "tilelang_mm_0(mat1, mat2, out, M, N, K)"
+           )
+```
+
+### 行优先约束
+
+`T.copy(B[k * _block_K, bx * _block_N], B_shared)` 假设 B 是行优先布局。  
+`nn.Linear` 的 `weight.T` 是列优先（stride `[1, K]`），Ascend DMA 用列优先 strides 读取 tile 会产生错误结果。  
+因此 TileLang 路径只在两个输入都是行优先时才启用，列优先输入 fallback 到 `aten_mm` / CATLASS。
+
+---
+
 ## 关键组件
 
 ### TileLangKernel
@@ -169,8 +235,12 @@ NPUTritonScheduling 方法           TileLangScheduling 行为
 __init__(input_scheduler)          super().__init__() 后强制 self.kernel_type = TileLangKernel
                                    （覆盖父类 __init__ 中设置的 NPUIndexTritonKernel）
 codegen_node_schedule()            完全继承（含 decide_codegen_dims_in_kernel）
-define_kernel(src, sched, k, h)    TileLang factory wrapper 模式（见 Pipeline ⑥）
+define_kernel(src, sched, k, h)    Pointwise/Reduction factory wrapper（见 Pipeline ⑥）
 codegen_sync()                     torch.npu.synchronize()
+── T.gemm 专用（新增）──────────────────────────────────────────────
+codegen_template(node, epilogue)   检测 _TileLangGemmRender → 生成 T.gemm 代码
+                                   否则 → _triton_scheduling.codegen_template()
+define_kernel_matmul(src, sched)   生成 factory(M,N,K) + shape dict cache + wrapper
 ```
 
 ---
@@ -262,6 +332,101 @@ Inductor 对所有 reduction 调用 `upcast_acc_dtype()` 将 fp16 → fp32 accum
 
 ---
 
+## Matmul Kernel 生成（T.gemm）
+
+### 生成的 @T.prim_func
+
+`codegen_tilelang_mm_src()` 生成以下结构（形状由工厂函数的 `_M/_N/_K` 变量注入）：
+
+```python
+import tilelang.language as T
+
+_block_M = 128   # M 方向 tile 大小
+_block_N = 128   # N 方向 tile 大小
+_block_K = 64    # K 方向 tile 大小（流水线方向）
+
+@T.prim_func
+def tilelang_mm_0_prim_fn(
+    A: T.Tensor((_M, _K), 'float16'),   # 输入 mat1
+    B: T.Tensor((_K, _N), 'float16'),   # 输入 mat2
+    C: T.Tensor((_M, _N), 'float32'),   # 输出（fp32 累加结果）
+):
+    # grid = M_tiles × N_tiles，每个 AIC 负责一个 (block_M × block_N) 子块
+    with T.Kernel(T.ceildiv(_N, _block_N) * T.ceildiv(_M, _block_M),
+                  is_npu=True) as (cid, _):
+        by = cid // T.ceildiv(_N, _block_N)   # M tile 索引
+        bx = cid % T.ceildiv(_N, _block_N)    # N tile 索引
+
+        # L1 缓冲（shared.dyn，FFTS 管理）
+        A_shared = T.alloc_shared((_block_M, _block_K), 'float16')
+        B_shared = T.alloc_shared((_block_K, _block_N), 'float16')
+        # 片上 cube 累加器（local.fragment）
+        C_local  = T.alloc_fragment((_block_M, _block_N), 'float32')
+
+        # K 方向双缓冲流水（隐藏 DMA 延迟）
+        for k in T.Pipelined(T.ceildiv(_K, _block_K), num_stages=2):
+            T.copy(A[by * _block_M, k * _block_K], A_shared)   # GM → L1
+            T.copy(B[k * _block_K, bx * _block_N], B_shared)   # GM → L1
+            T.gemm(A_shared, B_shared, C_local, initC=(k == 0)) # AIC cube 指令
+
+        T.copy(C_local, C[by * _block_M, bx * _block_N])        # L1 → GM
+```
+
+### 分块访问映射
+
+| 变量 | 含义 | 计算方式 |
+|---|---|---|
+| `cid` | AI Core block 编号（`blockIdx.x`） | TileLang runtime |
+| `by` | C 矩阵 M 方向 tile 索引 | `cid // N_tiles` |
+| `bx` | C 矩阵 N 方向 tile 索引 | `cid % N_tiles` |
+| `A_shared` | A 的 L1 片段（`shared.dyn`） | `T.alloc_shared` |
+| `B_shared` | B 的 L1 片段（`shared.dyn`） | `T.alloc_shared` |
+| `C_local` | 累加器（`local.fragment`） | `T.alloc_fragment` |
+| `initC=(k==0)` | k=0 时清零，否则累加 | 条件表达式 |
+
+### define_kernel_matmul — 生成的 wrapper
+
+```python
+# 工厂函数：运行时接受 M/N/K，构造 prim_func
+def _prim_factory_tilelang_mm_0(M, N, K):
+    _M, _N, _K = M, N, K
+    import tilelang.language as T
+    @T.prim_func
+    def tilelang_mm_0_prim_fn(A, B, C): ...   # 同上
+    return tilelang_mm_0_prim_fn
+
+# shape-keyed 缓存：相同 (M,N,K) 复用已编译 binary
+_tilelang_mm_0_cache = {}
+
+def tilelang_mm_0(A, B, C, M, N, K):
+    _key = (int(M), int(N), int(K))
+    if _key not in _tilelang_mm_0_cache:
+        _tilelang_mm_0_cache[_key] = _tilelang_0.compile(
+            _prim_factory_tilelang_mm_0(*_key), target='npuir'
+        )
+    _tilelang_mm_0_cache[_key](A, B, C)
+```
+
+output_code.py 中对应的调用：
+
+```python
+tilelang_mm_0(arg1_1, arg0_1, buf0, 256, 512, 128)
+```
+
+### Dtype 处理
+
+T.gemm 在 Ascend AIC cube 上使用 fp16 输入、fp32 片上累加，因此输出 buffer 必须是 fp32：
+
+| 阶段 | dtype | 说明 |
+|---|---|---|
+| A、B（输入） | fp16 | 原始用户数据 |
+| C_local（累加器） | fp32 | 防精度损失 |
+| C（输出 buffer） | fp32 | inductor 分配 FixedLayout(fp32) |
+
+`add_tilelang_gemm_choices()` 将 inductor 默认的 fp16 output layout 替换为 `FixedLayout(dtype=fp32, stride=[N,1])`。**必须用 `FixedLayout` 而非 `FlexibleLayout`**：当 mm 后有融合 epilogue（relu/sigmoid 等）时，scheduler 在 `SchedulerNode._compute_attrs()` 调 `make_indexer()`，而 `FlexibleLayout.allow_indexing = False` 会触发断言。
+
+---
+
 ## 向量 Op 映射
 
 ### Binary Ops（T.vXXX(A, B, C)）
@@ -327,6 +492,8 @@ Inductor 对所有 reduction 调用 `upcast_acc_dtype()` 将 fp16 → fp32 accum
 
 ## 已知限制
 
+### Pointwise / Reduction
+
 | 限制 | 说明 |
 |---|---|
 | Reduction 仅支持 persistent | `rnumel` 必须能放入 SRAM（非 persistent 抛 `NotImplementedError` → Triton fallback）|
@@ -338,35 +505,75 @@ Inductor 对所有 reduction 调用 `upcast_acc_dtype()` 将 fp16 → fp32 accum
 | 间接 indexing | 未测试 |
 | 动态 shape | 部分支持（工厂函数按 shape 缓存）|
 
+### Matmul (T.gemm)
+
+| 限制 | 说明 |
+|---|---|
+| 仅支持行优先输入 | 列优先（如 `weight.T`）fallback 到 aten_mm / CATLASS |
+| 输出 dtype 固定 fp32 | fp16 输入 → fp32 输出（比 aten.mm 的 fp16 输出精度更高但类型不同） |
+| 仅支持 fp16 / int8 输入 | bfloat16、fp32 等 fallback |
+| block_M/N/K 固定 | 128/128/64，不支持 autotuning |
+| `nn.Linear(bias=True)` | `aten.addmm` 需单独注册（已注册但未实现 T.gemm bias 融合）|
+| 无 benchmark 支持 | `TileLangGemmCaller.benchmark()` 返回 inf，不参与多候选竞争 |
+
 ---
 
 ## 文件结构
 
 ```
 torch_npu/_inductor/
-├── __init__.py                     后端注册（TORCHINDUCTOR_NPU_BACKEND=tilelang）
+├── __init__.py                     后端注册 + mm/addmm/bmm lowering 注册
+├── kernel/
+│   └── mm.py                       tuned_mm() + is_row_major_striding()
+│                                   TileLang 路径优先，列优先 fallback CATLASS/aten
 └── codegen/
     ├── tilelang.py                 ★ TileLang 后端主文件
-    │   ├── TileLangKernel          kernel 代码生成（op graph → @T.prim_func）
-    │   ├── TileLangScheduling      scheduling + define_kernel + factory wrapper
+    │   ├── TileLangKernel          Pointwise/Reduction kernel（op graph → @T.prim_func）
+    │   ├── TileLangScheduling      scheduling + define_kernel + codegen_template
     │   ├── TileLangOverrides       inductor op → TileLang 表达式字符串映射
-    │   ├── _BINARY_VEC_OPS         二元向量 op 映射表
-    │   ├── _UNARY_VEC_OPS          一元向量 op 映射表
-    │   ├── _REDUCE_OPS             reduction mode 映射表
-    │   └── _REDUCTION_ROW_BLOCK    每 AI Core 处理行数（默认 32）
+    │   ├── _BINARY_VEC_OPS / _UNARY_VEC_OPS   向量 op 映射表
+    │   ├── TileLangGemmCaller      ChoiceCaller（matmul 候选，不参与 benchmark）
+    │   ├── _TileLangGemmRender     TemplateBuffer.make_kernel_render 标记类
+    │   ├── add_tilelang_gemm_choices()  注册 T.gemm 为 mm 候选
+    │   ├── codegen_tilelang_mm_src()    生成 @T.prim_func 源码
+    │   └── define_kernel_matmul()       生成 factory(M,N,K) + shape cache wrapper
     ├── triton.py                   NPU Triton 后端（含 NPUIndexTritonKernel）
     ├── scheduling.py               NPUTritonScheduling + decide_codegen_dims_in_kernel
     ├── split_tiling.py             SplitTiling：select_split/tiling/no_loop_axis
     └── kernel_analysis.py          ReductionAnalysis：确定 reduced_dim
 
 examples/tilelang/
-└── demo_ops.py                     覆盖所有 op 的测试 demo
+├── demo_ops.py                     Pointwise / Reduction / Matmul 全量测试
+└── demo_gemm.py                    T.gemm 独立测试（直接 compile + inductor 两种模式）
 ```
 
 ---
 
 ## 调试
 
-`TileLangKernel.codegen_kernel()` 和 `define_kernel()` 会把生成的 `@T.prim_func` 源码打印到 stdout（`<<< src_code`）。如需关闭，删除 `tilelang.py` 中的 `print()` 调用。
+### Pointwise / Reduction
+
+`TileLangKernel.codegen_kernel()` 会在生成 `@T.prim_func` 时打印：
+
+```
+====== TileLang prim_func ======
+<源码>
+====== TileLang reduction prim_func ======
+<源码>
+```
+
+### Matmul (T.gemm)
+
+`codegen_tilelang_mm_src()` 和 `define_kernel_matmul()` 分别打印：
+
+```
+====== TileLang T.gemm prim_func ======
+<@T.prim_func 源码>
+
+====== TileLang T.gemm wrapper ======
+<factory + cache + wrapper 源码>
+```
+
+如需关闭，删除 `tilelang.py` 中对应的 `print()` 调用。
 
 TileLang 编译后会打印 TVM IR / NPUIR / final NPUIR，由 `tilelang.compile` 的 verbose 级别控制。
