@@ -237,6 +237,8 @@ def test_rms_norm():
     ref = fn(x, w)
     out = compiled(x, w)
     torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
+    _show("ref", ref)
+    _show("out", out)
     print(f"  PASS  max_err = {(out - ref).abs().max().item():.6f}  [Mixed]")
 
 
